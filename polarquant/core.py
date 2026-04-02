@@ -116,9 +116,13 @@ class PolarQuantizer:
         per-dimension variance differences that the theoretical N(0, 1/d)
         codebook cannot.
 
-        Recommended sample size: 500+ vectors for 4-bit, 100+ for 3-bit.
-        Below ~200 vectors at 4-bit, the data-oblivious codebook may
-        actually perform better due to noisy estimates.
+        Calibration requires sufficient samples to outperform the
+        data-oblivious codebook:
+        - **4-bit**: ≥750 vectors (below ~400, calibration hurts recall)
+        - **3-bit**: ≥100 vectors (benefits at smaller sample sizes)
+
+        On real embeddings (all-MiniLM-L6-v2, d=384), full-corpus
+        calibration improves R@10 by +2.9% at 4-bit and +3.8% at 3-bit.
 
         Args:
             X: (n, d) sample vectors (need not be the full corpus).
