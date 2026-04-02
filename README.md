@@ -1,69 +1,106 @@
 # polar-embed
 
-Retrieval-validated embedding compression. Compress your vectors 4-8x with proven recall.
+Retrieval-validated embedding compression. Compress vectors 8-15× with measured recall.
 
-Based on the rotation + Lloyd-Max insight from [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., ICLR 2026), focused exclusively on the use case that matters most: **embedding storage and retrieval**.
+Based on the rotation + Lloyd-Max insight from [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., ICLR 2026), focused on the use case that matters most: **embedding storage and retrieval for RAG**.
 
-## How it works
-
-1. **Random rotation** — A fixed orthogonal matrix transforms any input distribution so that coordinates become approximately i.i.d. N(0, 1/d). This is the key trick: it makes the quantizer data-oblivious.
-2. **Lloyd-Max scalar quantization** — Each coordinate is independently quantized using a codebook optimized for the known post-rotation Gaussian distribution. No per-vector or per-dataset calibration needed.
-
-The result: near-optimal MSE distortion within a ~2.7x constant factor of the information-theoretic lower bound, at any bit-width.
-
-## Usage
+## Quick start
 
 ```python
-from polar_embed import PolarQuantizer
+from polarquant import PolarQuantizer
 
-# Initialize (precomputes rotation matrix + codebook)
-pq = PolarQuantizer(d=768, bits=4)
+# Data-oblivious: no training data needed
+pq = PolarQuantizer(d=384, bits=4)
+compressed = pq.encode(embeddings)    # (n, 384) float32 → bit-packed
+indices, scores = pq.search(compressed, query, k=10)
 
-# Encode your embeddings
-compressed = pq.encode(embeddings)  # (n, 768) float32 → CompressedVectors
+# Optional: calibrate with a sample for +1-3% recall
+pq = PolarQuantizer(d=384, bits=4).calibrate(sample_vectors)
+compressed = pq.encode(embeddings)
 
-# Search
-indices, scores = pq.search(compressed, query_vector, k=10)
-
-# Or decode for downstream use
-reconstructed = pq.decode(compressed)  # (n, 768) float32
-
-# Save/load
+# Save/load (bit-packed format)
 compressed.save("index.npz")
 ```
 
-## Why polar-embed instead of full TurboQuant?
+## How it works
 
-TurboQuant adds a QJL (Quantized Johnson-Lindenstrauss) residual correction that makes inner product estimates provably unbiased. This matters for KV cache attention (where softmax amplifies bias) but **hurts** retrieval recall — the extra noise from QJL dequantization outweighs the debiasing benefit when only ranking matters.
+1. **Random rotation** — A fixed orthogonal matrix makes coordinates approximately i.i.d. N(0, 1/d). This is the key trick: it makes quantization data-oblivious.
+2. **Scalar quantization** — Each coordinate is independently quantized. Two modes:
+   - **Data-oblivious** (default): Lloyd-Max codebook optimized for the theoretical N(0, 1/d) distribution. Zero training data needed.
+   - **Calibrated**: Per-dimension k-means codebooks learned from a sample. Captures per-coordinate variance spread that the theoretical codebook can't.
+3. **Bit-packing** — Indices stored at actual bit width (not uint8), giving honest compression ratios.
 
-At 4-bit, d=256:
+## Benchmarks
 
-| Method | Recall@10 |
-|---|---|
-| polar-embed (rotation + Lloyd-Max) | **0.86** |
-| TurboQuant Prod (LM + QJL) | 0.68 |
-| Naive minmax | 0.78 |
+Tested on real embeddings from all-MiniLM-L6-v2 (d=384), 5k corpus, 200 queries.
 
-## Why not the other PolarQuant/TurboQuant implementations?
+### Compression ratios (bit-packed)
 
-There are 20+ repos implementing TurboQuant for KV cache compression. polar-embed is different:
+| Bits | Per vector (d=384) | vs float32 |
+|------|-------------------|------------|
+| 2 | 100 bytes | **15.4×** |
+| 3 | 148 bytes | **10.4×** |
+| 4 | 196 bytes | **7.8×** |
 
-- **Embedding-first** — optimized for vector storage and nearest-neighbor retrieval, not LLM inference
-- **Retrieval-validated** — benchmarked on recall@k, not just MSE or perplexity
-- **Zero calibration** — data-oblivious design means no training data or fitting step required
-- **Practitioners over researchers** — pip install, compress, search. No CUDA kernels or custom hardware needed.
+### Recall on real embeddings
+
+| Method | R@10 | R@100 | MSE |
+|--------|------|-------|-----|
+| PolarQuant 4-bit (oblivious) | 0.826 | 0.977 | 0.0096 |
+| PolarQuant 4-bit (calibrated, n=1000) | 0.838 | 0.981 | 0.0071 |
+| PolarQuant 3-bit (oblivious) | 0.733 | 0.963 | 0.0345 |
+| PolarQuant 3-bit (calibrated, n=1000) | 0.758 | 0.969 | 0.0226 |
+| PolarQuant 8-bit (oblivious) | 0.987 | 0.998 | 0.0001 |
+| FAISS PQ m=96 (16×, trained) | 0.863 | 0.966 | 0.0365 |
+| FAISS PQ m=48 (32×, trained) | 0.718 | 0.939 | 0.0778 |
+
+### Calibration: when to use it
+
+Calibration learns per-dimension codebooks from a sample. It helps when the sample is large enough:
+
+| Bits | Minimum sample | Benefit |
+|------|---------------|---------|
+| 4-bit | ≥750 vectors | +0.3% to +2.9% R@10 |
+| 3-bit | ≥100 vectors | +1.3% to +3.8% R@10 |
+
+Below these thresholds, the data-oblivious codebook performs better.
+
+### Search performance (100k vectors, d=384)
+
+| | First query (cold) | Subsequent queries |
+|---|---|---|
+| PolarQuant | 280-360ms | **6-9ms** |
+| FAISS PQ m=96 | — | 4ms |
+
+First search builds a cache; subsequent queries reuse it. Encode speed: ~20μs/vector (10-17× faster than FAISS PQ build time).
+
+## Why polar-embed over TurboQuant?
+
+TurboQuant adds QJL residual correction for unbiased inner product estimates. This helps KV cache attention but **hurts** retrieval — the variance from QJL outweighs the debiasing when only ranking matters.
+
+## Why not FAISS Product Quantization?
+
+FAISS PQ trains on your data and achieves higher recall at matched compression. Use FAISS when:
+- You have a stable corpus and can afford training time
+- Search latency at >50k vectors matters (FAISS has IVF for sublinear search)
+
+Use polar-embed when:
+- You want zero (or minimal) training — data-oblivious mode just works
+- Your corpus changes frequently (no retraining needed)
+- You need fast encode (20μs/vec vs 200μs+/vec for FAISS)
+- 8-bit near-lossless caching (R@10=0.987 at 4× compression)
 
 ## Install
 
 ```bash
 pip install -e ".[dev]"   # development
-pytest                     # run tests
+pip install -e ".[bench]" # + faiss-cpu, sentence-transformers
+pytest                     # 49 tests
 ```
 
 ## References
 
-- Zandieh, A., Daliri, M., Hadian, M., & Mirrokni, V. (2025). *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate.* ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
-- Zandieh, A., Daliri, M., & Han, I. (2024). *QJL: 1-Bit Quantized JL Transform for KV Cache Quantization with Zero Overhead.* AAAI 2025. [arXiv:2406.03482](https://arxiv.org/abs/2406.03482)
+- Zandieh et al. (2025). *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate.* ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
 
 ## License
 
