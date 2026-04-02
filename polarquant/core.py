@@ -7,32 +7,69 @@ from polarquant.rotation import haar_rotation
 
 
 class CompressedVectors:
-    """Container for quantized vector data."""
+    """Container for quantized vector data with bit-packed index storage.
 
-    __slots__ = ("indices", "norms", "d", "bits", "n")
+    Indices are stored in packed format to minimize memory. Unpacking
+    happens lazily on first access and is cached for repeated use
+    (e.g., multiple search queries against the same corpus).
+    """
 
-    def __init__(self, indices: np.ndarray, norms: np.ndarray, d: int, bits: int):
-        self.indices = indices
+    __slots__ = ("_packed", "_indices_cache", "norms", "d", "bits", "n")
+
+    def __init__(
+        self,
+        indices: np.ndarray,
+        norms: np.ndarray,
+        d: int,
+        bits: int,
+        *,
+        packed: bool = False,
+    ):
+        """
+        Args:
+            indices: Either uint8 indices (n, d) or pre-packed bytes.
+            norms: (n,) float32 vector norms.
+            d: Original vector dimension.
+            bits: Quantization bit width.
+            packed: If True, indices are already in packed format.
+        """
+        if packed:
+            self._packed = indices
+        else:
+            self._packed = pack_indices(indices, bits)
+        self._indices_cache = None
         self.norms = norms
         self.d = d
         self.bits = bits
-        self.n = indices.shape[0]
+        self.n = norms.shape[0]
+
+    @property
+    def indices(self) -> np.ndarray:
+        """Unpacked uint8 indices (n, d). Cached after first access."""
+        if self._indices_cache is None:
+            self._indices_cache = unpack_indices(self._packed, self.bits, self.d)
+        return self._indices_cache
 
     @property
     def nbytes(self) -> int:
-        """Actual memory footprint in bytes."""
-        return self.indices.nbytes + self.norms.nbytes
+        """Actual memory footprint in bytes (packed indices + norms)."""
+        return self._packed.nbytes + self.norms.nbytes
+
+    @property
+    def nbytes_unpacked(self) -> int:
+        """Memory if indices were stored as uint8 (for comparison)."""
+        return self.n * self.d + self.norms.nbytes
 
     @property
     def compression_ratio(self) -> float:
-        """Ratio vs float32 storage."""
+        """Compression vs float32 storage."""
         return (self.n * self.d * 4) / self.nbytes
 
     def save(self, path: str):
-        """Save to compressed .npz file."""
+        """Save to compressed .npz file (packed format)."""
         np.savez_compressed(
             path,
-            indices=self.indices,
+            packed=self._packed,
             norms=self.norms,
             d=np.int32(self.d),
             bits=np.int32(self.bits),
@@ -42,7 +79,21 @@ class CompressedVectors:
     def load(cls, path: str) -> "CompressedVectors":
         """Load from .npz file."""
         data = np.load(path)
-        return cls(data["indices"], data["norms"], int(data["d"]), int(data["bits"]))
+        if "packed" in data:
+            return cls(
+                data["packed"],
+                data["norms"],
+                int(data["d"]),
+                int(data["bits"]),
+                packed=True,
+            )
+        # Backward compat: old format stored unpacked "indices"
+        return cls(
+            data["indices"],
+            data["norms"],
+            int(data["d"]),
+            int(data["bits"]),
+        )
 
 
 class PolarQuantizer:
@@ -119,11 +170,9 @@ class PolarQuantizer:
 
         for j in range(self.d):
             col = X_rot[:, j]
-            # Initialize with quantile-spaced centroids
             c = np.percentile(
                 col, np.linspace(0, 100, n_levels + 2)[1:-1]
             ).astype(np.float32)
-            # Lloyd's algorithm (1D k-means)
             for _ in range(n_iter):
                 b = (c[:-1] + c[1:]) / 2
                 labels = np.searchsorted(b, col)
@@ -137,8 +186,8 @@ class PolarQuantizer:
             centroids[j] = c
             boundaries[j] = (c[:-1] + c[1:]) / 2
 
-        self.centroids = centroids   # (d, n_levels)
-        self.boundaries = boundaries  # (d, n_levels - 1)
+        self.centroids = centroids
+        self.boundaries = boundaries
         self.calibrated = True
         return self
 
@@ -162,19 +211,17 @@ class PolarQuantizer:
             X: (n, d) float array. Need not be unit-normalized.
 
         Returns:
-            CompressedVectors container with indices and norms.
+            CompressedVectors with bit-packed indices and norms.
         """
         X_rot, norms = self._rotate(X)
 
         if self.calibrated:
-            # Per-dimension searchsorted
             indices = np.empty(X_rot.shape, dtype=np.uint8)
             for j in range(self.d):
                 indices[:, j] = np.searchsorted(
                     self.boundaries[j], X_rot[:, j]
                 )
         else:
-            # Uniform codebook: boundaries broadcast across all dims
             indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
 
         return CompressedVectors(
@@ -191,12 +238,13 @@ class PolarQuantizer:
         Returns:
             (n, d) float32 array of approximate vectors.
         """
+        indices = compressed.indices  # lazy unpack + cache
+
         if self.calibrated:
-            # Per-dimension centroid lookup: centroids[j, indices[i,j]]
             dim_idx = np.arange(self.d)[np.newaxis, :]
-            X_hat_rot = self.centroids[dim_idx, compressed.indices]
+            X_hat_rot = self.centroids[dim_idx, indices]
         else:
-            X_hat_rot = self.centroids[compressed.indices]
+            X_hat_rot = self.centroids[indices]
 
         X_hat_unit = X_hat_rot @ self.R
         return X_hat_unit * compressed.norms[:, None]
@@ -223,11 +271,13 @@ class PolarQuantizer:
         query = np.asarray(query, dtype=np.float32)
         q_rot = self.R @ query
 
+        idx = compressed.indices  # lazy unpack + cache
+
         if self.calibrated:
             dim_idx = np.arange(self.d)[np.newaxis, :]
-            X_hat_rot = self.centroids[dim_idx, compressed.indices]
+            X_hat_rot = self.centroids[dim_idx, idx]
         else:
-            X_hat_rot = self.centroids[compressed.indices]
+            X_hat_rot = self.centroids[idx]
 
         scores = (X_hat_rot @ q_rot) * compressed.norms
 
