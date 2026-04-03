@@ -151,9 +151,11 @@ Main quantizer class.
 
 **`decode(compressed, precision=None)`** — Reconstruct `(n, d)` float32 from compressed. Optional `precision` (1 to bits) for Matryoshka decode.
 
-**`search(compressed, query, k=10, precision=None)`** — Find k nearest neighbors by approximate inner product. Returns `(indices, scores)`.
+**`search(compressed, query, k=10, precision=None)`** — Find k nearest neighbors by approximate inner product. Caches a dequantized float32 matrix for fast repeated queries. Returns `(indices, scores)`.
 
-**`search_twostage(compressed, query, k=10, candidates=500, coarse_precision=None)`** — Two-stage Matryoshka retrieval: coarse pass at lower precision, then full-precision rerank. Returns `(indices, scores)`.
+**`search_adc(compressed, query, k=10, precision=None, chunk_size=4096)`** — Memory-efficient search via lookup-table scoring. No float32 cache — peak memory is `chunk_size * d * 4` bytes (~6 MB). Slower per-query but uses 5x less RAM. Returns `(indices, scores)`.
+
+**`search_twostage(compressed, query, k=10, candidates=500, coarse_precision=None)`** — Two-stage Matryoshka retrieval: ADC coarse scan (no cache) then full-precision rerank on candidates only. Memory-efficient: only the small candidate set is dequantized. Returns `(indices, scores)`.
 
 **`mse(X, precision=None)`** — Mean per-vector reconstruction error (L2 squared).
 
@@ -167,12 +169,40 @@ Container for quantized data. Created by `PolarQuantizer.encode()`.
 - **`nbytes`** — Bit-packed size in bytes (honest compression).
 - **`nbytes_unpacked`** — In-memory size (uint8 indices + float32 norms).
 - **`compression_ratio`** — `(n * d * 4) / nbytes`.
+- **`resident_bytes`** — Actual RAM including any active caches.
 
 #### Methods
 
 - **`save(path)`** — Save to `.npz` with bit-packed indices.
 - **`load(path)`** — Class method. Load from `.npz`.
 - **`subset(idx)`** — Return a new `CompressedVectors` with only the given row indices.
+- **`drop_cache()`** — Free the dequantized float32 cache to reclaim memory.
+
+### `GPUSearcher` (optional)
+
+GPU-accelerated search wrapper. Requires CuPy or PyTorch with CUDA. Falls back to NumPy.
+
+```python
+from polar_embed.gpu import GPUSearcher
+
+searcher = GPUSearcher(pq, compressed)                # auto-detect backend
+searcher = GPUSearcher(pq, compressed, backend="torch")  # explicit
+
+indices, scores = searcher.search(query, k=10)           # cached, fast
+indices, scores = searcher.search_adc(query, k=10)       # low-memory ADC
+indices, scores = searcher.search_twostage(query, k=10, candidates=200)
+```
+
+### Memory profiles (100k vectors, d=384)
+
+| Strategy | Resident RAM | R@10 | ms/query |
+|---|---|---|---|
+| `search()` (cached) | 192 MB | 0.981 | 2.6 |
+| `search_adc()` (no cache) | 39 MB | 0.981 | 169 |
+| `search_twostage()` 4→8 (200 cands) | 39 MB | 0.981 | 175 |
+| `search_twostage()` 2→8 (200 cands) | 39 MB | 0.945 | 188 |
+
+Choose `search()` when latency matters and RAM is available. Choose `search_adc()` or `search_twostage()` when memory is constrained (e.g. serverless, edge, or very large corpora).
 
 ### Low-level utilities
 
@@ -225,7 +255,7 @@ pip install -e ".[bench]"               # benchmarking: + faiss-cpu, sentence-tr
 Run the test suite:
 
 ```bash
-pytest                                   # 66 tests
+pytest                                   # 88 tests
 pytest -v                                # verbose output
 python bench/benchmark.py                # self-contained benchmark (no extra deps)
 python bench/real_embedding_eval.py      # real embeddings (requires bench deps)
