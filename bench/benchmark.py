@@ -97,33 +97,6 @@ def run_benchmark():
             label = f"PolarQuant {bits}-bit (oblivious)"
             print(f"{label:<35s} {ratio:>5.1f}x {mse:>10.4f} {r10:>7.3f} {r100:>7.3f} {enc_ms:>7.0f} {search_ms:>7.0f}")
 
-        # Calibrated mode (4-bit and 3-bit)
-        for bits in [3, 4]:
-            pq = PolarQuantizer(d=d, bits=bits)
-            sample_size = min(n_corpus, 2000)
-            pq.calibrate(corpus[:sample_size])
-
-            t0 = time.perf_counter()
-            compressed = pq.encode(corpus)
-            enc_ms = (time.perf_counter() - t0) * 1000
-
-            mse = pq.mse(corpus[:min(1000, n_corpus)])
-            ratio = compressed.compression_ratio
-
-            all_pred = []
-            t0 = time.perf_counter()
-            for q in queries:
-                idx, _ = pq.search(compressed, q, k=100)
-                all_pred.append(idx)
-            search_ms = (time.perf_counter() - t0) * 1000
-            pred = np.array(all_pred)
-
-            r10 = recall_at_k(pred, truth10, 10)
-            r100 = recall_at_k(pred, truth100, 100)
-
-            label = f"PolarQuant {bits}-bit (calibrated)"
-            print(f"{label:<35s} {ratio:>5.1f}x {mse:>10.4f} {r10:>7.3f} {r100:>7.3f} {enc_ms:>7.0f} {search_ms:>7.0f}")
-
         # Two-stage search (Matryoshka)
         pq = PolarQuantizer(d=d, bits=4)
         compressed = pq.encode(corpus)

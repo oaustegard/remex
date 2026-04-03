@@ -100,14 +100,8 @@ class PolarQuantizer:
     2. Applying a random orthogonal rotation (makes coordinates ~N(0, 1/d))
     3. Scalar-quantizing each coordinate with a Lloyd-Max codebook
 
-    Two modes:
-    - **Data-oblivious** (default): Uses a theoretical Lloyd-Max codebook for
-      N(0, 1/d). No training data needed. Based on TurboQuant (Zandieh et al.,
-      ICLR 2026).
-    - **Calibrated**: Call ``calibrate(sample)`` with a few hundred vectors to
-      learn per-dimension codebooks via k-means. Improves recall on real
-      embeddings where post-rotation coordinate distributions vary across
-      dimensions.
+    Data-oblivious: Uses a theoretical Lloyd-Max codebook for N(0, 1/d).
+    No training data needed. Based on TurboQuant (Zandieh et al., ICLR 2026).
 
     Supports **nested bit precision**: encode once at full bit-width,
     then search at any lower precision by right-shifting indices.
@@ -127,78 +121,12 @@ class PolarQuantizer:
         self.d = d
         self.bits = bits
         self.seed = seed
-        self.calibrated = False
 
         self.R = haar_rotation(d, seed)
         self.boundaries, self.centroids = lloyd_max_codebook(d, bits)
 
         # Precompute nested centroid tables for all bit levels <= bits
         self._nested = nested_codebooks(d, bits)
-
-    def calibrate(self, X: np.ndarray, n_iter: int = 50) -> "PolarQuantizer":
-        """
-        Fit per-dimension codebooks from sample data.
-
-        Rotates the sample, then runs 1D k-means independently on each
-        coordinate to learn dimension-specific centroids. This captures
-        per-dimension variance differences that the theoretical N(0, 1/d)
-        codebook cannot.
-
-        Calibration requires sufficient samples to outperform the
-        data-oblivious codebook:
-        - **4-bit**: ≥750 vectors (below ~400, calibration hurts recall)
-        - **3-bit**: ≥100 vectors (benefits at smaller sample sizes)
-
-        On real embeddings (all-MiniLM-L6-v2, d=384), full-corpus
-        calibration improves R@10 by +2.9% at 4-bit and +3.8% at 3-bit.
-
-        Note: Matryoshka nested precision is not available in calibrated mode,
-        since per-dimension codebooks don't share the Gaussian nesting property.
-
-        Args:
-            X: (n, d) sample vectors (need not be the full corpus).
-            n_iter: K-means iterations per dimension.
-
-        Returns:
-            self (for chaining: ``pq = PolarQuantizer(d, bits).calibrate(sample)``)
-        """
-        X = np.asarray(X, dtype=np.float32)
-        if X.ndim == 1:
-            X = X[np.newaxis]
-        if X.shape[1] != self.d:
-            raise ValueError(f"Expected d={self.d}, got {X.shape[1]}")
-
-        # Rotate sample
-        norms = np.linalg.norm(X, axis=1)
-        X_unit = X / np.maximum(norms, 1e-8)[:, None]
-        X_rot = X_unit @ self.R.T
-
-        n_levels = 2 ** self.bits
-        centroids = np.zeros((self.d, n_levels), dtype=np.float32)
-        boundaries = np.zeros((self.d, n_levels - 1), dtype=np.float32)
-
-        for j in range(self.d):
-            col = X_rot[:, j]
-            c = np.percentile(
-                col, np.linspace(0, 100, n_levels + 2)[1:-1]
-            ).astype(np.float32)
-            for _ in range(n_iter):
-                b = (c[:-1] + c[1:]) / 2
-                labels = np.searchsorted(b, col)
-                new_c = np.empty_like(c)
-                for lev in range(n_levels):
-                    mask = labels == lev
-                    new_c[lev] = col[mask].mean() if mask.sum() > 0 else c[lev]
-                if np.allclose(c, new_c, atol=1e-7):
-                    break
-                c = new_c
-            centroids[j] = c
-            boundaries[j] = (c[:-1] + c[1:]) / 2
-
-        self.centroids = centroids
-        self.boundaries = boundaries
-        self.calibrated = True
-        return self
 
     def encode(self, X: np.ndarray) -> CompressedVectors:
         """
@@ -220,14 +148,7 @@ class PolarQuantizer:
         X_unit = X / np.maximum(norms, 1e-8)[:, None]
         X_rot = X_unit @ self.R.T
 
-        if self.calibrated:
-            indices = np.empty(X_rot.shape, dtype=np.uint8)
-            for j in range(self.d):
-                indices[:, j] = np.searchsorted(
-                    self.boundaries[j], X_rot[:, j]
-                )
-        else:
-            indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
+        indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
 
         return CompressedVectors(
             indices, norms.astype(np.float32), self.d, self.bits
@@ -249,12 +170,7 @@ class PolarQuantizer:
         """
         centroids = self._resolve_centroids(compressed, precision)
         indices = self._resolve_indices(compressed, precision)
-
-        if self.calibrated and precision is None:
-            dim_idx = np.arange(self.d)[np.newaxis, :]
-            X_hat_rot = centroids[dim_idx, indices]
-        else:
-            X_hat_rot = centroids[indices]
+        X_hat_rot = centroids[indices]
 
         X_hat_unit = X_hat_rot @ self.R
         return X_hat_unit * compressed.norms[:, None]
@@ -333,12 +249,8 @@ class PolarQuantizer:
         indices = self._resolve_indices(compressed, precision)
 
         # Build ADC lookup table: table[j, i] = centroid_i * q_rot_j
-        if self.calibrated and precision is None:
-            # calibrated: centroids are (d, n_levels)
-            table = (centroids * q_rot[:, np.newaxis]).astype(np.float32)
-        else:
-            # oblivious: centroids are (n_levels,), same for all dims
-            table = np.outer(q_rot, centroids).astype(np.float32)
+        # centroids are (n_levels,), same for all dims
+        table = np.outer(q_rot, centroids).astype(np.float32)
         # table shape: (d, n_levels)
 
         scores = self._adc_score_chunked(
@@ -399,12 +311,7 @@ class PolarQuantizer:
         coarse_centroids = self._resolve_centroids(compressed, coarse_precision)
         coarse_indices = self._resolve_indices(compressed, coarse_precision)
 
-        if self.calibrated and coarse_precision is None:
-            coarse_table = (coarse_centroids * q_rot[:, np.newaxis]).astype(
-                np.float32
-            )
-        else:
-            coarse_table = np.outer(q_rot, coarse_centroids).astype(np.float32)
+        coarse_table = np.outer(q_rot, coarse_centroids).astype(np.float32)
 
         coarse_scores = self._adc_score_chunked(
             coarse_table, coarse_indices, compressed.norms, coarse_chunk_size
@@ -419,11 +326,7 @@ class PolarQuantizer:
         fine_centroids = self._resolve_centroids(compressed, None)
         fine_indices = compressed.indices[coarse_idx]
 
-        if self.calibrated:
-            dim_idx = np.arange(self.d)[np.newaxis, :]
-            X_hat_cand = fine_centroids[dim_idx, fine_indices]
-        else:
-            X_hat_cand = fine_centroids[fine_indices]  # (candidates, d)
+        X_hat_cand = fine_centroids[fine_indices]  # (candidates, d)
 
         fine_scores = (X_hat_cand @ q_rot) * compressed.norms[coarse_idx]
         rerank_order = np.argsort(-fine_scores)[:k]
@@ -492,11 +395,7 @@ class PolarQuantizer:
         centroids = self._resolve_centroids(compressed, precision)
         indices = self._resolve_indices(compressed, precision)
 
-        if self.calibrated and precision is None:
-            dim_idx = np.arange(self.d)[np.newaxis, :]
-            X_hat_rot = centroids[dim_idx, indices]
-        else:
-            X_hat_rot = centroids[indices]
+        X_hat_rot = centroids[indices]
 
         # Cache only full-precision results
         if precision is None:
@@ -510,11 +409,6 @@ class PolarQuantizer:
         """Get centroid table for the requested precision level."""
         if precision is None:
             return self.centroids
-        if self.calibrated:
-            raise ValueError(
-                "Matryoshka precision is not available in calibrated mode. "
-                "Per-dimension codebooks don't support bit-level nesting."
-            )
         if precision < 1 or precision > self.bits:
             raise ValueError(
                 f"precision must be 1-{self.bits}, got {precision}"

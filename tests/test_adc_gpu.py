@@ -232,24 +232,3 @@ class TestGPUSearcherNumpy:
         assert "numpy" in available_backends()
 
 
-class TestGPUSearcherCalibrated:
-    """Test GPUSearcher with calibrated quantizer (numpy backend)."""
-
-    def test_calibrated_search(self):
-        from polar_embed.gpu import GPUSearcher
-        rng = np.random.default_rng(42)
-        d = 64
-        n = 500
-        pq = PolarQuantizer(d=d, bits=4)
-        corpus = rng.standard_normal((n, d)).astype(np.float32)
-        corpus /= np.linalg.norm(corpus, axis=1, keepdims=True)
-        pq.calibrate(corpus)
-        comp = pq.encode(corpus)
-        query = rng.standard_normal(d).astype(np.float32)
-        query /= np.linalg.norm(query)
-
-        searcher = GPUSearcher(pq, comp, backend="numpy")
-        idx_pq, scores_pq = pq.search(comp, query, k=10)
-        idx_gpu, scores_gpu = searcher.search(query, k=10)
-        np.testing.assert_array_equal(idx_pq, idx_gpu)
-        np.testing.assert_allclose(scores_pq, scores_gpu, rtol=1e-5)

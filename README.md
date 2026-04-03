@@ -18,10 +18,6 @@ indices, scores = pq.search(compressed, query, k=10)
 compressed.save("index.npz")
 from polar_embed import CompressedVectors
 loaded = CompressedVectors.load("index.npz")
-
-# Optional: calibrate for +1-3% recall on real embeddings
-pq = PolarQuantizer(d=384, bits=4).calibrate(sample_vectors)
-compressed = pq.encode(embeddings)
 ```
 
 ## How it works
@@ -30,9 +26,7 @@ Three steps, each with a clear purpose:
 
 1. **Random rotation** — A fixed orthogonal matrix (Haar-distributed) transforms any embedding distribution so that coordinates become approximately i.i.d. N(0, 1/d). This is the key insight from TurboQuant: it makes quantization data-oblivious, meaning no training data is required.
 
-2. **Scalar quantization** — Each coordinate is independently quantized using Lloyd-Max optimal boundaries for the N(0, 1/d) distribution. Two modes:
-   - **Data-oblivious** (default): Theoretical codebook. Zero training. Works on any embeddings.
-   - **Calibrated**: Per-dimension k-means codebooks learned from a sample. Captures variance differences the theoretical codebook misses.
+2. **Scalar quantization** — Each coordinate is independently quantized using Lloyd-Max optimal boundaries for the N(0, 1/d) distribution. Theoretical codebook. Zero training. Works on any embeddings.
 
 3. **Bit-packing** — Indices are stored at their actual bit width (not wasteful uint8), giving honest compression ratios. A 4-bit codebook uses 4 bits per coordinate on disk.
 
@@ -41,7 +35,6 @@ Norms are stored separately as float32, so inner-product ranking is preserved ex
 ## Features
 
 - **Data-oblivious compression**: No training, no fitting, no index to ship. The quantizer is fully determined by (dimension, bits, seed).
-- **Calibrated mode**: Optional per-dimension codebooks for +1-3% recall when you have sample data.
 - **Matryoshka bit precision**: Encode once at full bit-width, search at any lower precision by right-shifting indices. Enables two-stage coarse-to-fine retrieval from a single representation.
 - **Bit-packed serialization**: `save()`/`load()` uses true sub-byte packing. Compression ratios are honest.
 - **Fast encode**: ~20us/vector. 10-17x faster than FAISS PQ index build.
@@ -60,9 +53,7 @@ Tested with synthetic embeddings that mimic real model characteristics (cluster 
 |--------|------------|-----|------|-------|
 | PolarQuant 8-bit (oblivious) | 4.0x | 0.0000 | 0.987 | 0.991 |
 | PolarQuant 4-bit (oblivious) | 7.8x | 0.0094 | 0.850 | 0.895 |
-| PolarQuant 4-bit (calibrated) | 7.8x | 0.0098 | 0.860 | 0.887 |
 | PolarQuant 3-bit (oblivious) | 10.4x | 0.0343 | 0.719 | 0.800 |
-| PolarQuant 3-bit (calibrated) | 10.4x | 0.0335 | 0.726 | 0.799 |
 | PolarQuant 2-bit (oblivious) | 15.4x | 0.1171 | 0.538 | 0.634 |
 
 #### Scaling with corpus size (4-bit oblivious)
@@ -104,34 +95,11 @@ polar-embed is not the best tool for every compression scenario. Here's where it
 
 - **FAISS PQ wins at matched compression on real data.** At 16x compression, FAISS PQ (m=96) achieves R@10=0.816 vs PolarQuant 2-bit at 0.517. FAISS trains on your data and learns subspace structure. This is the fundamental data-oblivious vs data-adaptive trade-off.
 
-- **Calibration helps less than expected.** On real embeddings, calibration adds +1-3% R@10 at 3-4 bits. It doesn't close the gap with FAISS. On synthetic data with uniform cluster spread, calibration provides negligible benefit.
-
 - **Linear scan only (for now).** Search is brute-force dot product over all vectors. No sublinear indexing (IVF, HNSW). At >100k vectors, latency grows linearly. The two-stage architecture is a natural fit for adding partition-based coarse search, or for plugging polar-embed's training-free encoding into an existing ANN index.
 
 - **Matryoshka nesting penalty.** Nested codebooks are ~1.2% worse than independently optimized codebooks at 4-bit, but up to ~10% worse at 2-bit. For two-stage search, the coarse pass only needs to identify the right neighborhood (not rank precisely), so the penalty is less impactful in practice.
 
 - **CPU only (for now).** All operations are NumPy on CPU. The hot path (matrix multiply + top-k) maps trivially to GPU via CuPy or PyTorch tensors — contributions welcome.
-
-## Calibration guide
-
-Calibration fits per-dimension Lloyd-Max codebooks via k-means on rotated sample data. It captures the per-coordinate variance heterogeneity that the theoretical N(0, 1/d) codebook cannot.
-
-```python
-pq = PolarQuantizer(d=384, bits=4).calibrate(sample_vectors)
-```
-
-**When to use it:**
-
-| Bits | Minimum sample size | Expected benefit |
-|------|-------------------|-----------------|
-| 4-bit | >= 750 vectors | +0.3% to +2.9% R@10 |
-| 3-bit | >= 100 vectors | +1.3% to +3.8% R@10 |
-
-Below these thresholds, the data-oblivious codebook outperforms calibrated.
-
-**Limitations of calibrated mode:**
-- Matryoshka nested precision is **not available** (per-dimension codebooks don't share the Gaussian nesting property). Calling `search()` or `decode()` with a `precision` argument raises `ValueError`.
-- The calibration sample should be representative of your corpus. A biased sample can hurt recall.
 
 ## API reference
 
@@ -144,8 +112,6 @@ Main quantizer class.
 - **`seed`** — Random seed for the rotation matrix. Same seed = same quantizer.
 
 #### Methods
-
-**`calibrate(X, n_iter=50)`** — Fit per-dimension codebooks from sample `X` (n, d). Returns `self` for chaining.
 
 **`encode(X)`** — Quantize `(n, d)` float32 array. Returns `CompressedVectors`.
 
@@ -226,7 +192,7 @@ TurboQuant adds QJL (quantized Johnson-Lindenstrauss) residual correction for un
 
 | | polar-embed | FAISS PQ |
 |---|---|---|
-| Training | None (or optional calibration) | Required (trains on corpus) |
+| Training | None | Required (trains on corpus) |
 | Recall at matched compression | Lower on real data | Higher (learns structure) |
 | Encode speed | ~20us/vec | ~200us+/vec |
 | Corpus updates | Re-encode only new vectors | Retrain or accept stale codebook |

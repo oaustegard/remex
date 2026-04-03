@@ -18,7 +18,7 @@ polar_embed/
 └── gpu.py            # Optional GPU backend (CuPy/PyTorch/NumPy)
 
 tests/
-├── test_polar_embed.py   # Core: rotation, codebook, quantizer, retrieval, calibration, packing
+├── test_polar_embed.py   # Core: rotation, codebook, quantizer, retrieval, packing
 ├── test_matryoshka.py    # Nested codebooks, precision parameter, two-stage search, subset
 └── test_adc_gpu.py       # ADC search, memory accounting, GPUSearcher (numpy fallback)
 
@@ -69,7 +69,7 @@ python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cp
 ## Code conventions
 
 - **NumPy-only core**: No PyTorch/CuPy dependency in `polar_embed/core.py`. GPU support is opt-in via `polar_embed/gpu.py`.
-- **No training by default**: The data-oblivious path must work with zero sample data.
+- **No training**: Fully data-oblivious. The quantizer is determined by `(d, bits, seed)` alone.
 - **Honest compression**: `nbytes` property uses bit-packed sizes, not uint8. Benchmark tables report packed compression ratios.
 - **Deterministic**: Same `(d, bits, seed)` must produce identical results across runs.
 - **Test thresholds**: Recall tests use conservative bounds (e.g. 2-bit R@10 >= 0.3, not exact values) because recall depends on random data.
@@ -82,9 +82,7 @@ python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cp
 
 3. **ADC for memory efficiency** — The lookup table `(d, 2^bits)` is tiny (~6KB for 2-bit d=384). Chunked scoring keeps temporary allocation at ~6MB regardless of corpus size.
 
-4. **Calibration is optional and separate** — `calibrate()` fits per-dimension codebooks but disables Matryoshka (per-dim codebooks don't nest). This is a deliberate trade-off.
-
-5. **GPU is a wrapper, not a fork** — `GPUSearcher` wraps `PolarQuantizer + CompressedVectors` rather than replacing them. The core stays pure NumPy.
+4. **GPU is a wrapper, not a fork** — `GPUSearcher` wraps `PolarQuantizer + CompressedVectors` rather than replacing them. The core stays pure NumPy.
 
 ## Testing
 

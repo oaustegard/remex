@@ -336,7 +336,6 @@ doc_ids, scores = cache.search_low_memory(query_embedding, k=10)
 ## Tips
 
 - **Start with 8-bit** (R@10=0.98, 4x compression). Drop to 4-bit only if you need more compression and can tolerate R@10~0.85.
-- **Calibrate if you can**: `pq.calibrate(sample)` with 1000+ vectors improves recall by 1-3% on real embeddings at 3-4 bit.
 - **Use `search_twostage()` for large corpora**: At 100k+ vectors, ADC two-stage gives the same recall as cached search at 5x less RAM.
 - **Save/load for persistence**: `compressed.save("index.npz")` / `CompressedVectors.load("index.npz")` uses bit-packed format. Smaller than storing uint8 in the DB.
 - **Deterministic quantizer**: `PolarQuantizer(d=384, bits=4, seed=42)` produces identical results everywhere. No need to ship a trained index — just agree on the parameters.

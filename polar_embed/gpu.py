@@ -267,7 +267,6 @@ class GPUSearcher:
         for prec, c in quantizer._nested.items():
             self._nested[prec] = self.ops.to_device(c.astype(np.float32))
 
-        self._calibrated = quantizer.calibrated
         self._bits = quantizer.bits
         self._d = quantizer.d
         self._n = compressed.n
@@ -334,16 +333,8 @@ class GPUSearcher:
         centroids, indices = self._resolve_gpu(precision)
 
         # Build ADC table: (d, n_levels)
-        if self._calibrated and precision is None:
-            # centroids: (d, n_levels)
-            table = centroids * q_rot.unsqueeze(1) if self.backend_name == "torch" \
-                else centroids * q_rot[:, None]
-        else:
-            # centroids: (n_levels,)
-            if self.backend_name == "torch":
-                table = ops.xp.outer(q_rot, centroids)
-            else:
-                table = ops.xp.outer(q_rot, centroids)
+        # centroids: (n_levels,)
+        table = ops.xp.outer(q_rot, centroids)
 
         scores = ops.gather_sum(table, indices) * self._norms
         idx, vals = ops.topk(scores, k)
@@ -387,16 +378,7 @@ class GPUSearcher:
 
         # Stage 2: dequantize candidates at full precision, rerank
         fine_indices = self._indices[coarse_idx]  # (candidates, d)
-
-        if self._calibrated:
-            if self.backend_name == "torch":
-                dim_idx = ops.xp.arange(self._d, device=self._centroids.device)
-                X_hat_cand = self._centroids[dim_idx, fine_indices]
-            else:
-                dim_idx = ops.xp.arange(self._d)
-                X_hat_cand = self._centroids[dim_idx, fine_indices]
-        else:
-            X_hat_cand = self._centroids[fine_indices]
+        X_hat_cand = self._centroids[fine_indices]
 
         fine_scores = ops.matvec(X_hat_cand, q_rot) * self._norms[coarse_idx]
         rerank_idx, rerank_scores = ops.topk(fine_scores, k)
@@ -414,25 +396,13 @@ class GPUSearcher:
 
     def _build_x_hat_rot(self):
         """Dequantize indices to float32 on GPU."""
-        ops = self.ops
-        if self._calibrated:
-            if self.backend_name == "torch":
-                dim_idx = ops.xp.arange(self._d, device=self._centroids.device)
-            else:
-                dim_idx = ops.xp.arange(self._d)
-            return self._centroids[dim_idx, self._indices]
-        else:
-            return self._centroids[self._indices]
+        return self._centroids[self._indices]
 
     def _resolve_gpu(self, precision: Optional[int]):
         """Get (centroids, indices) on GPU for given precision."""
         if precision is None or precision == self._bits:
             return self._centroids, self._indices
 
-        if self._calibrated:
-            raise ValueError(
-                "Matryoshka precision is not available in calibrated mode."
-            )
         if precision < 1 or precision > self._bits:
             raise ValueError(
                 f"precision must be 1-{self._bits}, got {precision}"
