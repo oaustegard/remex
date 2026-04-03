@@ -98,7 +98,7 @@ def recall_at_k(pred, truth, k):
 
 def benchmark_polarquant(corpus, queries, d, bits_list, k_list):
     """Run PolarQuant at various bit widths, report recall."""
-    from polarquant import PolarQuantizer
+    from polar_embed import PolarQuantizer
 
     results = []
     for bits in bits_list:
@@ -172,7 +172,7 @@ def benchmark_faiss_pq(corpus, queries, d, m_list, k_list):
 
 def analyze_embedding_distribution(corpus, d):
     """Check if post-rotation coordinates are Gaussian (the key assumption)."""
-    from polarquant.rotation import haar_rotation
+    from polar_embed.rotation import haar_rotation
 
     R = haar_rotation(d, seed=42)
     norms = np.linalg.norm(corpus, axis=1)

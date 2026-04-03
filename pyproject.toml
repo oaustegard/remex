@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "polar-embed"
-version = "0.2.0"
+version = "0.5.0"
 description = "Retrieval-validated embedding compression. 4-8x smaller vectors, proven recall."
 readme = "README.md"
 license = {text = "MIT"}
@@ -15,6 +15,9 @@ dependencies = ["numpy>=1.24", "scipy>=1.10"]
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov"]
 bench = ["faiss-cpu", "sentence-transformers"]
+
+[tool.setuptools.packages.find]
+include = ["polar_embed*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

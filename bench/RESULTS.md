@@ -27,7 +27,7 @@
 | FAISS PQ (m=48) | 32× | 0.0636 | 0.618 | 0.877 |
 | FAISS PQ (m=96) | 16× | 0.0341 | 0.816 | 0.946 |
 
-*PolarQuant compression assumes bit-packing (not yet implemented). Current storage uses uint8 per coordinate.
+*PolarQuant compression uses bit-packing for on-disk storage. In-memory indices use uint8 for fast search.
 
 ## Recall Results: Random Unit Vectors
 

@@ -427,20 +427,20 @@ class TestPacking:
     """Tests for bit-packed index storage."""
 
     def test_pack_unpack_roundtrip_all_bits(self):
-        from polar_embed.packing import pack_indices, unpack_indices
+        from polar_embed.packing import pack, unpack
         rng = np.random.default_rng(99)
         for bits in range(1, 9):
             indices = rng.integers(0, 2**bits, size=(50, 384), dtype=np.uint8)
-            packed = pack_indices(indices, bits)
-            unpacked = unpack_indices(packed, bits, 384)
+            packed = pack(indices, bits)
+            unpacked = unpack(packed, bits, indices.size).reshape(indices.shape)
             assert np.array_equal(indices, unpacked), f"Roundtrip failed at {bits}-bit"
 
     def test_packed_size_correct(self):
-        from polar_embed.packing import pack_indices, packed_nbytes
+        from polar_embed.packing import pack, packed_nbytes
         rng = np.random.default_rng(99)
         for bits in [2, 3, 4]:
             indices = rng.integers(0, 2**bits, size=(100, 384), dtype=np.uint8)
-            packed = pack_indices(indices, bits)
+            packed = pack(indices, bits)
             expected = packed_nbytes(100, 384, bits)
             assert packed.nbytes == expected
 

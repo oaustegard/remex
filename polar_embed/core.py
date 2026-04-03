@@ -23,7 +23,7 @@ class CompressedVectors:
         self.d = d
         self.bits = bits
         self.n = indices.shape[0]
-        self._x_hat_rot = None  # cached dequantized rotated vectors
+        self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
 
     def subset(self, idx: np.ndarray) -> "CompressedVectors":
         """Return a CompressedVectors containing only the given row indices."""
@@ -48,6 +48,18 @@ class CompressedVectors:
     def compression_ratio(self) -> float:
         """Ratio vs float32 storage (using packed size)."""
         return (self.n * self.d * 4) / self.nbytes
+
+    @property
+    def resident_bytes(self) -> int:
+        """Actual RAM footprint including any active caches."""
+        total = self.indices.nbytes + self.norms.nbytes
+        if self._x_hat_rot is not None:
+            total += self._x_hat_rot.nbytes
+        return total
+
+    def drop_cache(self):
+        """Free the dequantized float32 cache to reclaim memory."""
+        self._x_hat_rot = None
 
     def save(self, path: str):
         """Save to compressed .npz file with bit-packed indices."""
@@ -100,8 +112,7 @@ class PolarQuantizer:
     Supports **nested bit precision**: encode once at full bit-width,
     then search at any lower precision by right-shifting indices.
     The top k bits of an n-bit code are a valid k-bit code, with
-    centroid tables precomputed for each level. Nesting penalty is
-    typically <1.5% recall vs independently optimized codebooks.
+    centroid tables precomputed for each level.
 
     Args:
         d: Vector dimension.
@@ -286,6 +297,61 @@ class PolarQuantizer:
             topk_idx = topk_idx[np.argsort(-scores[topk_idx])]
         return topk_idx, scores[topk_idx]
 
+    def search_adc(
+        self,
+        compressed: CompressedVectors,
+        query: np.ndarray,
+        k: int = 10,
+        precision: Optional[int] = None,
+        chunk_size: int = 4096,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Memory-efficient search via asymmetric distance computation.
+
+        Computes approximate inner products using a lookup table over
+        the uint8 indices, without materializing an (n, d) float32 matrix.
+        Peak temporary memory is chunk_size * d * 4 bytes (~6 MB default).
+
+        Slower per-query than ``search()`` (no persistent cache), but
+        uses dramatically less RAM. Ideal for the coarse stage of
+        two-stage retrieval, or when memory is constrained.
+
+        Args:
+            compressed: Encoded corpus.
+            query: (d,) query vector.
+            k: Number of results.
+            precision: Bit precision (1 to self.bits). None = full.
+            chunk_size: Vectors per scoring chunk. Controls peak memory.
+
+        Returns:
+            (indices, scores): top-k corpus indices and approximate scores.
+        """
+        query = np.asarray(query, dtype=np.float32)
+        q_rot = self.R @ query
+
+        centroids = self._resolve_centroids(compressed, precision)
+        indices = self._resolve_indices(compressed, precision)
+
+        # Build ADC lookup table: table[j, i] = centroid_i * q_rot_j
+        if self.calibrated and precision is None:
+            # calibrated: centroids are (d, n_levels)
+            table = (centroids * q_rot[:, np.newaxis]).astype(np.float32)
+        else:
+            # oblivious: centroids are (n_levels,), same for all dims
+            table = np.outer(q_rot, centroids).astype(np.float32)
+        # table shape: (d, n_levels)
+
+        scores = self._adc_score_chunked(
+            table, indices, compressed.norms, chunk_size
+        )
+
+        if k >= compressed.n:
+            topk_idx = np.argsort(-scores)
+        else:
+            topk_idx = np.argpartition(-scores, k)[:k]
+            topk_idx = topk_idx[np.argsort(-scores[topk_idx])]
+        return topk_idx, scores[topk_idx]
+
     def search_twostage(
         self,
         compressed: CompressedVectors,
@@ -293,15 +359,21 @@ class PolarQuantizer:
         k: int = 10,
         candidates: int = 500,
         coarse_precision: Optional[int] = None,
+        coarse_chunk_size: int = 4096,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Two-stage retrieval: coarse search then full-precision rerank.
+        Two-stage retrieval: memory-efficient coarse scan + precise rerank.
 
-        Stage 1: Search at coarse_precision for top `candidates`.
-        Stage 2: Rerank candidates at full precision for top `k`.
+        Stage 1 (coarse): ADC lookup-table scan over the full corpus at
+        reduced precision. No float32 cache — memory cost is only the
+        uint8 indices (already stored) plus a tiny lookup table.
 
-        This leverages the Matryoshka bit nesting — the same encoded
-        data is searched at two different precision levels.
+        Stage 2 (fine): Dequantize only the candidate vectors at full
+        precision, then rerank by exact (quantized) inner product.
+
+        Memory profile at 100k vectors, d=384:
+          - Single-stage search():    154 MB  (cached n*d float32)
+          - Two-stage search_twostage: ~39 MB  (uint8 indices + 6 MB temp)
 
         Args:
             compressed: Encoded corpus.
@@ -310,6 +382,7 @@ class PolarQuantizer:
             candidates: Number of coarse candidates (stage 1).
             coarse_precision: Bit precision for coarse pass.
                               Default: max(1, self.bits - 2).
+            coarse_chunk_size: Chunk size for ADC scoring.
 
         Returns:
             (indices, scores): top-k corpus indices and full-precision scores.
@@ -318,18 +391,45 @@ class PolarQuantizer:
         if coarse_precision is None:
             coarse_precision = max(1, self.bits - 2)
 
-        # Stage 1: coarse pass
+        query = np.asarray(query, dtype=np.float32)
+        q_rot = self.R @ query
         coarse_k = min(candidates, compressed.n)
-        coarse_idx, _ = self.search(compressed, query, k=coarse_k,
-                                    precision=coarse_precision)
 
-        # Stage 2: rerank at full precision
-        subset = compressed.subset(coarse_idx)
-        rerank_idx, rerank_scores = self.search(subset, query, k=k)
+        # Stage 1: ADC coarse scan — no float32 cache needed
+        coarse_centroids = self._resolve_centroids(compressed, coarse_precision)
+        coarse_indices = self._resolve_indices(compressed, coarse_precision)
 
-        # Map back to original corpus indices
-        original_idx = coarse_idx[rerank_idx]
-        return original_idx, rerank_scores
+        if self.calibrated and coarse_precision is None:
+            coarse_table = (coarse_centroids * q_rot[:, np.newaxis]).astype(
+                np.float32
+            )
+        else:
+            coarse_table = np.outer(q_rot, coarse_centroids).astype(np.float32)
+
+        coarse_scores = self._adc_score_chunked(
+            coarse_table, coarse_indices, compressed.norms, coarse_chunk_size
+        )
+
+        if coarse_k >= compressed.n:
+            coarse_idx = np.argsort(-coarse_scores)
+        else:
+            coarse_idx = np.argpartition(-coarse_scores, coarse_k)[:coarse_k]
+
+        # Stage 2: full-precision rerank on small candidate set
+        fine_centroids = self._resolve_centroids(compressed, None)
+        fine_indices = compressed.indices[coarse_idx]
+
+        if self.calibrated:
+            dim_idx = np.arange(self.d)[np.newaxis, :]
+            X_hat_cand = fine_centroids[dim_idx, fine_indices]
+        else:
+            X_hat_cand = fine_centroids[fine_indices]  # (candidates, d)
+
+        fine_scores = (X_hat_cand @ q_rot) * compressed.norms[coarse_idx]
+        rerank_order = np.argsort(-fine_scores)[:k]
+
+        original_idx = coarse_idx[rerank_order]
+        return original_idx, fine_scores[rerank_order]
 
     def mse(self, X: np.ndarray, precision: Optional[int] = None) -> float:
         """Compute mean per-vector reconstruction MSE (L2 squared)."""
@@ -338,6 +438,46 @@ class PolarQuantizer:
         return float(
             np.mean(np.sum((np.asarray(X, np.float32) - X_hat) ** 2, axis=1))
         )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _adc_score_chunked(
+        table: np.ndarray,
+        indices: np.ndarray,
+        norms: np.ndarray,
+        chunk_size: int,
+    ) -> np.ndarray:
+        """Score vectors via ADC lookup table, processing in chunks.
+
+        Args:
+            table: (d, n_levels) float32 lookup table.
+            indices: (n, d) uint8 quantization indices.
+            norms: (n,) float32 vector norms.
+            chunk_size: Rows per chunk (controls peak memory).
+
+        Returns:
+            (n,) float32 approximate inner-product scores.
+
+        Memory: peak allocation is chunk_size * d * 4 bytes.
+        At chunk_size=4096, d=384: ~6 MB temporary.
+        """
+        n = len(norms)
+        d = table.shape[0]
+        dim_idx = np.arange(d)
+        scores = np.empty(n, dtype=np.float32)
+
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            chunk_idx = indices[start:end]  # (chunk, d) uint8
+            # Gather: table[j, chunk_idx[i, j]] → (chunk, d) float32
+            # Then sum over d → (chunk,) inner-product contribution
+            chunk_scores = table[dim_idx, chunk_idx].sum(axis=1)
+            scores[start:end] = chunk_scores * norms[start:end]
+
+        return scores
 
     def _get_x_hat_rot(
         self, compressed: CompressedVectors, precision: Optional[int] = None

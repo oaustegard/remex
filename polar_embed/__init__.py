@@ -14,7 +14,7 @@ from polar_embed.core import PolarQuantizer, CompressedVectors
 from polar_embed.codebook import lloyd_max_codebook, nested_codebooks
 from polar_embed.packing import pack, unpack, packed_nbytes
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __all__ = [
     "PolarQuantizer", "CompressedVectors",
     "lloyd_max_codebook", "nested_codebooks",
