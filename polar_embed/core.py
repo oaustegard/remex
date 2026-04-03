@@ -15,7 +15,7 @@ class CompressedVectors:
     computing the true compressed size (nbytes).
     """
 
-    __slots__ = ("indices", "norms", "d", "bits", "n", "_x_hat_rot")
+    __slots__ = ("indices", "norms", "d", "bits", "n", "_x_hat_rot", "_x_hat_rot_cache")
 
     def __init__(self, indices: np.ndarray, norms: np.ndarray, d: int, bits: int):
         self.indices = indices  # (n, d) uint8 — unpacked for fast access
@@ -23,7 +23,8 @@ class CompressedVectors:
         self.d = d
         self.bits = bits
         self.n = indices.shape[0]
-        self._x_hat_rot = None  # cached dequantized rotated vectors
+        self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
+        self._x_hat_rot_cache = {}  # precision → cached dequantized rotated vectors
 
     def subset(self, idx: np.ndarray) -> "CompressedVectors":
         """Return a CompressedVectors containing only the given row indices."""
@@ -32,6 +33,8 @@ class CompressedVectors:
         )
         if self._x_hat_rot is not None:
             sub._x_hat_rot = self._x_hat_rot[idx]
+        for prec, cached in self._x_hat_rot_cache.items():
+            sub._x_hat_rot_cache[prec] = cached[idx]
         return sub
 
     @property
@@ -303,6 +306,10 @@ class PolarQuantizer:
         This leverages the Matryoshka bit nesting — the same encoded
         data is searched at two different precision levels.
 
+        Both the coarse-precision and full-precision dequantized
+        representations are cached on the CompressedVectors object,
+        so repeated queries pay only the dot-product cost.
+
         Args:
             compressed: Encoded corpus.
             query: (d,) query vector.
@@ -318,18 +325,25 @@ class PolarQuantizer:
         if coarse_precision is None:
             coarse_precision = max(1, self.bits - 2)
 
-        # Stage 1: coarse pass
+        query = np.asarray(query, dtype=np.float32)
+        q_rot = self.R @ query
         coarse_k = min(candidates, compressed.n)
-        coarse_idx, _ = self.search(compressed, query, k=coarse_k,
-                                    precision=coarse_precision)
 
-        # Stage 2: rerank at full precision
-        subset = compressed.subset(coarse_idx)
-        rerank_idx, rerank_scores = self.search(subset, query, k=k)
+        # Stage 1: coarse pass at reduced precision (cached)
+        X_coarse = self._get_x_hat_rot_at(compressed, coarse_precision)
+        coarse_scores = (X_coarse @ q_rot) * compressed.norms
+        if coarse_k >= compressed.n:
+            coarse_idx = np.argsort(-coarse_scores)
+        else:
+            coarse_idx = np.argpartition(-coarse_scores, coarse_k)[:coarse_k]
 
-        # Map back to original corpus indices
-        original_idx = coarse_idx[rerank_idx]
-        return original_idx, rerank_scores
+        # Stage 2: rerank at full precision (cached)
+        X_full = self._get_x_hat_rot(compressed)
+        fine_scores = (X_full[coarse_idx] @ q_rot) * compressed.norms[coarse_idx]
+        rerank_order = np.argsort(-fine_scores)[:k]
+
+        original_idx = coarse_idx[rerank_order]
+        return original_idx, fine_scores[rerank_order]
 
     def mse(self, X: np.ndarray, precision: Optional[int] = None) -> float:
         """Compute mean per-vector reconstruction MSE (L2 squared)."""
@@ -362,6 +376,23 @@ class PolarQuantizer:
         if precision is None:
             compressed._x_hat_rot = X_hat_rot
 
+        return X_hat_rot
+
+    def _get_x_hat_rot_at(
+        self, compressed: CompressedVectors, precision: int
+    ) -> np.ndarray:
+        """Get dequantized vectors in rotated space at a specific precision, with caching."""
+        if precision == self.bits:
+            return self._get_x_hat_rot(compressed)
+
+        if precision in compressed._x_hat_rot_cache:
+            return compressed._x_hat_rot_cache[precision]
+
+        centroids = self._resolve_centroids(compressed, precision)
+        indices = self._resolve_indices(compressed, precision)
+        X_hat_rot = centroids[indices]
+
+        compressed._x_hat_rot_cache[precision] = X_hat_rot
         return X_hat_rot
 
     def _resolve_centroids(
