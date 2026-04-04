@@ -464,7 +464,12 @@ class Quantizer:
 
     def __init__(self, d: int, bits: int = 4, seed: int = 42):
         if bits < 1 or bits > 8:
-            raise ValueError(f"bits must be 1-8, got {bits}")
+            raise ValueError(f"bits must be 1-4 or 8, got {bits}")
+        if bits in (5, 6, 7):
+            raise ValueError(
+                f"bits={bits} is not supported. Use 1-4 or 8 bits. "
+                f"5-7 bit widths offer negligible benefit over 4-bit or 8-bit."
+            )
 
         self.d = d
         self.bits = bits
@@ -709,6 +714,65 @@ class Quantizer:
 
         original_idx = coarse_idx[rerank_order]
         return original_idx, fine_scores[rerank_order]
+
+    def search_batch(
+        self,
+        compressed: CompressedVectors,
+        queries: np.ndarray,
+        k: int = 10,
+        precision: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Find k nearest neighbors for a batch of queries.
+
+        Uses matrix multiplication instead of per-query matvec for
+        significantly better throughput via BLAS-level parallelism.
+
+        Args:
+            compressed: Encoded corpus (CompressedVectors only).
+            queries: (n_queries, d) query matrix.
+            k: Number of results per query.
+            precision: Bit precision for search (1 to self.bits). None = full.
+
+        Returns:
+            (indices, scores): both (n_queries, k) arrays.
+                indices[i] = top-k corpus indices for query i.
+                scores[i] = corresponding approximate scores, descending.
+
+        Raises:
+            TypeError: If passed a PackedVectors.
+        """
+        if isinstance(compressed, PackedVectors):
+            raise TypeError(
+                "PackedVectors does not support cached search_batch(). "
+                "Use search_adc() or search_twostage(), or convert "
+                "with packed.to_compressed() first."
+            )
+        queries = np.asarray(queries, dtype=np.float32)
+        if queries.ndim == 1:
+            queries = queries[np.newaxis]
+
+        n_queries = queries.shape[0]
+        Q_rot = queries @ self.R.T  # (n_queries, d)
+
+        X_hat_rot = self._get_x_hat_rot(compressed, precision)
+        # (n_queries, n) = (n_queries, d) @ (d, n)
+        all_scores = (Q_rot @ X_hat_rot.T) * compressed.norms[np.newaxis, :]
+
+        all_indices = np.empty((n_queries, min(k, compressed.n)), dtype=np.intp)
+        all_topk_scores = np.empty((n_queries, min(k, compressed.n)), dtype=np.float32)
+
+        for i in range(n_queries):
+            scores_i = all_scores[i]
+            if k >= compressed.n:
+                topk_idx = np.argsort(-scores_i)
+            else:
+                topk_idx = np.argpartition(-scores_i, k)[:k]
+                topk_idx = topk_idx[np.argsort(-scores_i[topk_idx])]
+            all_indices[i] = topk_idx
+            all_topk_scores[i] = scores_i[topk_idx]
+
+        return all_indices, all_topk_scores
 
     def mse(self, X: np.ndarray, precision: Optional[int] = None) -> float:
         """Compute mean per-vector reconstruction MSE (L2 squared)."""

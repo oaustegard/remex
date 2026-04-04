@@ -127,10 +127,27 @@ class _NumpyOps:
             idx = idx[np.argsort(-scores[idx])]
         return idx, scores[idx]
 
-    def gather_sum(self, table, indices):
-        """table: (d, n_levels), indices: (n, d) → (n,) sum of lookups."""
+    def gather_sum(self, table, indices, chunk_size=0):
+        """table: (d, n_levels), indices: (n, d) → (n,) sum of lookups.
+
+        Args:
+            chunk_size: If >0, process in chunks to limit peak memory
+                        from n*d*4 to chunk_size*d*4 bytes.
+        """
+        if chunk_size > 0:
+            return self._gather_sum_chunked(table, indices, chunk_size)
         dim_idx = np.arange(table.shape[0])
         return table[dim_idx, indices].sum(axis=1)
+
+    def _gather_sum_chunked(self, table, indices, chunk_size):
+        n = indices.shape[0]
+        d = table.shape[0]
+        dim_idx = np.arange(d)
+        scores = np.empty(n, dtype=np.float32)
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            scores[start:end] = table[dim_idx, indices[start:end]].sum(axis=1)
+        return scores
 
 
 class _CuPyOps:
@@ -162,10 +179,23 @@ class _CuPyOps:
             idx = idx[cp.argsort(-scores[idx])]
         return idx, scores[idx]
 
-    def gather_sum(self, table, indices):
+    def gather_sum(self, table, indices, chunk_size=0):
+        if chunk_size > 0:
+            return self._gather_sum_chunked(table, indices, chunk_size)
         cp = self._cp
         dim_idx = cp.arange(table.shape[0])
         return table[dim_idx, indices].sum(axis=1)
+
+    def _gather_sum_chunked(self, table, indices, chunk_size):
+        cp = self._cp
+        n = indices.shape[0]
+        d = table.shape[0]
+        dim_idx = cp.arange(d)
+        scores = cp.empty(n, dtype=cp.float32)
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            scores[start:end] = table[dim_idx, indices[start:end]].sum(axis=1)
+        return scores
 
 
 class _TorchOps:
@@ -198,18 +228,32 @@ class _TorchOps:
         vals, idx = torch.topk(scores, actual_k)
         return idx, vals
 
-    def gather_sum(self, table, indices):
+    def gather_sum(self, table, indices, chunk_size=0):
         """table: (d, n_levels) float32, indices: (n, d) int64 → (n,)."""
+        if chunk_size > 0:
+            return self._gather_sum_chunked(table, indices, chunk_size)
         torch = self._torch
         d, n_levels = table.shape
         n = indices.shape[0]
-        # Flatten to 1D gather, then reshape and sum
-        # offset each dimension: flat_idx = indices + dim_offset * n_levels
-        dim_offsets = torch.arange(d, device=table.device) * n_levels  # (d,)
-        flat_table = table.reshape(-1)  # (d * n_levels,)
-        flat_idx = indices + dim_offsets.unsqueeze(0)  # (n, d)
-        gathered = flat_table[flat_idx.reshape(-1)].reshape(n, d)  # (n, d)
+        dim_offsets = torch.arange(d, device=table.device) * n_levels
+        flat_table = table.reshape(-1)
+        flat_idx = indices + dim_offsets.unsqueeze(0)
+        gathered = flat_table[flat_idx.reshape(-1)].reshape(n, d)
         return gathered.sum(dim=1)
+
+    def _gather_sum_chunked(self, table, indices, chunk_size):
+        torch = self._torch
+        d, n_levels = table.shape
+        n = indices.shape[0]
+        dim_offsets = torch.arange(d, device=table.device) * n_levels
+        flat_table = table.reshape(-1)
+        scores = torch.empty(n, dtype=torch.float32, device=table.device)
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            chunk_idx = indices[start:end] + dim_offsets.unsqueeze(0)
+            gathered = flat_table[chunk_idx.reshape(-1)].reshape(end - start, d)
+            scores[start:end] = gathered.sum(dim=1)
+        return scores
 
 
 def _make_ops(backend: str):
@@ -318,11 +362,12 @@ class GPUSearcher:
         query: np.ndarray,
         k: int = 10,
         precision: Optional[int] = None,
+        chunk_size: int = 4096,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Memory-efficient ADC search on GPU.
 
         No float32 cache — builds a (d, 2^bits) lookup table per query,
-        then gathers + sums over indices.
+        then gathers + sums over indices in chunks to limit peak memory.
 
         Returns numpy arrays.
         """
@@ -333,10 +378,9 @@ class GPUSearcher:
         centroids, indices = self._resolve_gpu(precision)
 
         # Build ADC table: (d, n_levels)
-        # centroids: (n_levels,)
         table = ops.xp.outer(q_rot, centroids)
 
-        scores = ops.gather_sum(table, indices) * self._norms
+        scores = ops.gather_sum(table, indices, chunk_size=chunk_size) * self._norms
         idx, vals = ops.topk(scores, k)
         return ops.to_numpy(idx), ops.to_numpy(vals)
 
@@ -346,6 +390,7 @@ class GPUSearcher:
         k: int = 10,
         candidates: int = 500,
         coarse_precision: Optional[int] = None,
+        coarse_chunk_size: int = 4096,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Two-stage search: ADC coarse on GPU + precise rerank.
 
@@ -363,15 +408,13 @@ class GPUSearcher:
         q_rot = ops.matvec(self._R, q)
         coarse_k = min(candidates, self._n)
 
-        # Stage 1: ADC coarse
+        # Stage 1: ADC coarse (chunked to limit peak memory)
         coarse_centroids, coarse_indices = self._resolve_gpu(coarse_precision)
+        coarse_table = ops.xp.outer(q_rot, coarse_centroids)
 
-        if self.backend_name == "torch":
-            coarse_table = ops.xp.outer(q_rot, coarse_centroids)
-        else:
-            coarse_table = ops.xp.outer(q_rot, coarse_centroids)
-
-        coarse_scores = ops.gather_sum(coarse_table, coarse_indices) * self._norms
+        coarse_scores = ops.gather_sum(
+            coarse_table, coarse_indices, chunk_size=coarse_chunk_size
+        ) * self._norms
 
         # Top candidates (no sort needed, just partition)
         coarse_idx, _ = ops.topk(coarse_scores, coarse_k)
@@ -385,6 +428,48 @@ class GPUSearcher:
 
         original_idx = coarse_idx[rerank_idx]
         return ops.to_numpy(original_idx), ops.to_numpy(rerank_scores)
+
+    def search_batch(
+        self,
+        queries: np.ndarray,
+        k: int = 10,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Cached batch search on GPU.
+
+        Uses matmul for all queries simultaneously, leveraging BLAS
+        parallelism for significantly better throughput than per-query search.
+
+        Args:
+            queries: (n_queries, d) query matrix.
+            k: Number of results per query.
+
+        Returns:
+            (indices, scores): both (n_queries, k) numpy arrays.
+        """
+        ops = self.ops
+        Q = ops.to_device(np.asarray(queries, dtype=np.float32))
+        Q_rot = ops.matmul(Q, self._R.T if hasattr(self._R, 'T') else ops.xp.transpose(self._R))
+
+        if self._x_hat_rot_gpu is None:
+            self._x_hat_rot_gpu = self._build_x_hat_rot()
+
+        # (n_queries, n) = (n_queries, d) @ (n, d).T
+        if self.backend_name == "torch":
+            all_scores = ops.matmul(Q_rot, self._x_hat_rot_gpu.T) * self._norms
+        else:
+            all_scores = ops.matmul(Q_rot, self._x_hat_rot_gpu.T) * self._norms
+
+        n_queries = Q.shape[0]
+        actual_k = min(k, self._n)
+        all_indices = np.empty((n_queries, actual_k), dtype=np.intp)
+        all_topk_scores = np.empty((n_queries, actual_k), dtype=np.float32)
+
+        for i in range(n_queries):
+            idx, vals = ops.topk(all_scores[i], k)
+            all_indices[i] = ops.to_numpy(idx)
+            all_topk_scores[i] = ops.to_numpy(vals)
+
+        return all_indices, all_topk_scores
 
     def drop_cache(self):
         """Free the GPU-resident dequantized cache."""

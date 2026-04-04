@@ -1,14 +1,15 @@
 """Bit-packing for sub-byte quantization indices.
 
 Packs uint8 index arrays into minimal bits for storage compression.
-Supports 1-8 bits per value.
+Supports 1-4 and 8 bits per value. 5-7 bit widths are not supported
+as they offer negligible practical benefit over 4-bit or 8-bit.
 
 Packing ratios:
   1-bit: 8 values per byte (8:1)
   2-bit: 4 values per byte (4:1)
   3-bit: 8 values per 3 bytes (2.67:1)
   4-bit: 2 values per byte (2:1)
-  5-8 bit: 1 value per byte (1:1)
+  8-bit: 1 value per byte (1:1)
 """
 
 import numpy as np
@@ -25,6 +26,11 @@ def pack(indices: np.ndarray, bits: int) -> np.ndarray:
     Returns:
         Packed uint8 byte array.
     """
+    if bits in (5, 6, 7):
+        raise ValueError(
+            f"Bit width {bits} is not supported. Use 1-4 or 8 bits. "
+            f"5-7 bit widths offer negligible benefit over 4-bit or 8-bit."
+        )
     flat = indices.ravel().astype(np.uint8)
     n = len(flat)
 
@@ -64,8 +70,9 @@ def pack(indices: np.ndarray, bits: int) -> np.ndarray:
         out[:, 2] = ((groups[:, 5] & 3) << 6) | (groups[:, 6] << 3) | groups[:, 7]
         return out.ravel()
     else:
-        # 5, 6, 7 bits: generic bitstream packing
-        return _pack_generic(flat, bits)
+        raise ValueError(
+            f"Bit width {bits} is not supported. Use 1-4 or 8 bits."
+        )
 
 
 def unpack(packed: np.ndarray, bits: int, n_values: int) -> np.ndarray:
@@ -80,6 +87,11 @@ def unpack(packed: np.ndarray, bits: int, n_values: int) -> np.ndarray:
     Returns:
         (n_values,) uint8 array.
     """
+    if bits in (5, 6, 7):
+        raise ValueError(
+            f"Bit width {bits} is not supported. Use 1-4 or 8 bits. "
+            f"5-7 bit widths offer negligible benefit over 4-bit or 8-bit."
+        )
     if bits == 8:
         return packed[:n_values].copy()
     elif bits == 4:
@@ -110,11 +122,17 @@ def unpack(packed: np.ndarray, bits: int, n_values: int) -> np.ndarray:
         out[:, 7] = b2 & 0x07
         return out.ravel()[:n_values]
     else:
-        return _unpack_generic(packed, bits, n_values)
+        raise ValueError(
+            f"Bit width {bits} is not supported. Use 1-4 or 8 bits."
+        )
 
 
 def packed_nbytes(n_values: int, d: int, bits: int) -> int:
     """Compute packed byte count for n_values vectors of dimension d."""
+    if bits in (5, 6, 7):
+        raise ValueError(
+            f"Bit width {bits} is not supported. Use 1-4 or 8 bits."
+        )
     total_values = n_values * d
     if bits == 8:
         return total_values
@@ -127,7 +145,9 @@ def packed_nbytes(n_values: int, d: int, bits: int) -> int:
     elif bits == 3:
         return ((total_values + 7) // 8) * 3
     else:
-        return (total_values * bits + 7) // 8
+        raise ValueError(
+            f"Bit width {bits} is not supported. Use 1-4 or 8 bits."
+        )
 
 
 def _pad_to_multiple(arr: np.ndarray, multiple: int) -> np.ndarray:

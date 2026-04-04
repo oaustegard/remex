@@ -129,6 +129,9 @@ class TestQuantizer:
             Quantizer(128, bits=0)
         with pytest.raises(ValueError):
             Quantizer(128, bits=9)
+        for bits in [5, 6, 7]:
+            with pytest.raises(ValueError, match="not supported"):
+                Quantizer(128, bits=bits)
 
     def test_deterministic(self, unit_vectors):
         pq1 = Quantizer(256, bits=4, seed=42)
@@ -141,11 +144,11 @@ class TestQuantizer:
 # ── MSE and distortion tests ──
 
 class TestDistortion:
-    @pytest.mark.parametrize("bits", [2, 3, 4])
-    def test_mse_decreases_with_bits(self, unit_vectors, bits):
+    @pytest.mark.parametrize("bits_lo,bits_hi", [(2, 3), (3, 4), (4, 8)])
+    def test_mse_decreases_with_bits(self, unit_vectors, bits_lo, bits_hi):
         """More bits should always reduce MSE."""
-        pq_lo = Quantizer(256, bits=bits)
-        pq_hi = Quantizer(256, bits=bits + 1)
+        pq_lo = Quantizer(256, bits=bits_lo)
+        pq_hi = Quantizer(256, bits=bits_hi)
         assert pq_lo.mse(unit_vectors) > pq_hi.mse(unit_vectors)
 
     @pytest.mark.parametrize("bits", [2, 3, 4])
@@ -319,11 +322,23 @@ class TestPacking:
     def test_pack_unpack_roundtrip_all_bits(self):
         from remex.packing import pack, unpack
         rng = np.random.default_rng(99)
-        for bits in range(1, 9):
+        for bits in [1, 2, 3, 4, 8]:
             indices = rng.integers(0, 2**bits, size=(50, 384), dtype=np.uint8)
             packed = pack(indices, bits)
             unpacked = unpack(packed, bits, indices.size).reshape(indices.shape)
             assert np.array_equal(indices, unpacked), f"Roundtrip failed at {bits}-bit"
+
+    def test_unsupported_bit_widths_raise(self):
+        from remex.packing import pack, unpack, packed_nbytes
+        rng = np.random.default_rng(99)
+        for bits in [5, 6, 7]:
+            indices = rng.integers(0, 2**bits, size=100, dtype=np.uint8)
+            with pytest.raises(ValueError, match="not supported"):
+                pack(indices, bits)
+            with pytest.raises(ValueError, match="not supported"):
+                unpack(indices, bits, 100)
+            with pytest.raises(ValueError, match="not supported"):
+                packed_nbytes(10, 10, bits)
 
     def test_packed_size_correct(self):
         from remex.packing import pack, packed_nbytes

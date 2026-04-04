@@ -82,14 +82,10 @@ def run_benchmark():
             mse = pq.mse(corpus[:min(1000, n_corpus)])
             ratio = compressed.compression_ratio
 
-            # Search
-            all_pred = []
+            # Search (batch)
             t0 = time.perf_counter()
-            for q in queries:
-                idx, _ = pq.search(compressed, q, k=100)
-                all_pred.append(idx)
+            pred, _ = pq.search_batch(compressed, queries, k=100)
             search_ms = (time.perf_counter() - t0) * 1000
-            pred = np.array(all_pred)
 
             r10 = recall_at_k(pred, truth10, 10)
             r100 = recall_at_k(pred, truth100, 100)
