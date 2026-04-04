@@ -383,3 +383,21 @@ class TestPacking:
         # 2-bit: 96 bytes indices + 4 bytes norm = 100 per vec
         # ratio ≈ 1536/100 ≈ 15.4×
         assert comp.compression_ratio > 14.0
+
+
+class TestDeprecatedAlias:
+    """Test that PolarQuantizer alias works but emits a deprecation warning."""
+
+    def test_polar_quantizer_alias_warns(self):
+        import remex
+        with pytest.warns(DeprecationWarning, match="PolarQuantizer has been renamed"):
+            PQ = remex.PolarQuantizer
+        assert PQ is Quantizer
+
+    def test_polar_quantizer_alias_functional(self):
+        import remex
+        with pytest.warns(DeprecationWarning):
+            pq = remex.PolarQuantizer(d=64, bits=4)
+        X = np.random.default_rng(0).standard_normal((10, 64)).astype(np.float32)
+        comp = pq.encode(X)
+        assert comp.n == 10
