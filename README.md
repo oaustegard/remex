@@ -1,22 +1,24 @@
-# polar-embed
+# remex
 
 Retrieval-validated embedding compression. 2-16x smaller vectors with measured recall.
+
+> Formerly known as **polar-embed**.
 
 Based on the rotation + Lloyd-Max scalar quantization insight from [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., ICLR 2026), focused on the use case that matters most: **embedding storage and retrieval for RAG systems**.
 
 ## Quick start
 
 ```python
-from polar_embed import PolarQuantizer
+from remex import Quantizer
 
 # Compress embeddings — no training data needed
-pq = PolarQuantizer(d=384, bits=4)       # d = your embedding dimension
+pq = Quantizer(d=384, bits=4)       # d = your embedding dimension
 compressed = pq.encode(embeddings)        # (n, 384) float32 → compressed
 indices, scores = pq.search(compressed, query, k=10)
 
 # Save/load (bit-packed on disk)
 compressed.save("index.npz")
-from polar_embed import CompressedVectors
+from remex import CompressedVectors
 loaded = CompressedVectors.load("index.npz")
 ```
 
@@ -51,10 +53,10 @@ Tested with synthetic embeddings that mimic real model characteristics (cluster 
 
 | Method | Compression | MSE | R@10 | R@100 |
 |--------|------------|-----|------|-------|
-| PolarQuant 8-bit (oblivious) | 4.0x | 0.0000 | 0.987 | 0.991 |
-| PolarQuant 4-bit (oblivious) | 7.8x | 0.0094 | 0.850 | 0.895 |
-| PolarQuant 3-bit (oblivious) | 10.4x | 0.0343 | 0.719 | 0.800 |
-| PolarQuant 2-bit (oblivious) | 15.4x | 0.1171 | 0.538 | 0.634 |
+| remex 8-bit (oblivious) | 4.0x | 0.0000 | 0.987 | 0.991 |
+| remex 4-bit (oblivious) | 7.8x | 0.0094 | 0.850 | 0.895 |
+| remex 3-bit (oblivious) | 10.4x | 0.0343 | 0.719 | 0.800 |
+| remex 2-bit (oblivious) | 15.4x | 0.1171 | 0.538 | 0.634 |
 
 #### Scaling with corpus size (4-bit oblivious)
 
@@ -71,10 +73,10 @@ From `bench/real_embedding_eval.py` using 10k corpus and 500 queries encoded by 
 
 | Method | Compression | MSE | R@10 | R@100 |
 |--------|------------|-----|------|-------|
-| PolarQuant 8-bit | 2.0x | 0.0000 | 0.974 | 0.995 |
-| PolarQuant 4-bit | 7.8x | 0.0093 | 0.707 | 0.932 |
-| PolarQuant 3-bit | 10.4x | 0.0341 | 0.599 | 0.897 |
-| PolarQuant 2-bit | 16x | 0.1164 | 0.517 | 0.860 |
+| remex 8-bit | 2.0x | 0.0000 | 0.974 | 0.995 |
+| remex 4-bit | 7.8x | 0.0093 | 0.707 | 0.932 |
+| remex 3-bit | 10.4x | 0.0341 | 0.599 | 0.897 |
+| remex 2-bit | 16x | 0.1164 | 0.517 | 0.860 |
 | FAISS PQ (m=96, trained) | 16x | 0.0341 | 0.816 | 0.946 |
 | FAISS PQ (m=48, trained) | 32x | 0.0636 | 0.618 | 0.877 |
 
@@ -89,13 +91,13 @@ From `bench/real_embedding_eval.py` using 10k corpus and 500 queries encoded by 
 
 ## Limitations and honest positioning
 
-polar-embed is not the best tool for every compression scenario. Here's where it falls short:
+remex is not the best tool for every compression scenario. Here's where it falls short:
 
 - **Real embeddings degrade more than synthetic.** On all-MiniLM-L6-v2 embeddings, 4-bit R@10 drops from ~0.85 (synthetic) to 0.707 (real). Real embeddings cluster by topic, and tight clusters amplify quantization errors in ranking. The Gaussian assumption holds globally but not per-dimension (sigma varies 2x across dimensions, from ~0.03 to ~0.06).
 
-- **FAISS PQ wins at matched compression on real data.** At 16x compression, FAISS PQ (m=96) achieves R@10=0.816 vs PolarQuant 2-bit at 0.517. FAISS trains on your data and learns subspace structure. This is the fundamental data-oblivious vs data-adaptive trade-off.
+- **FAISS PQ wins at matched compression on real data.** At 16x compression, FAISS PQ (m=96) achieves R@10=0.816 vs remex 2-bit at 0.517. FAISS trains on your data and learns subspace structure. This is the fundamental data-oblivious vs data-adaptive trade-off.
 
-- **Linear scan only (for now).** Search is brute-force dot product over all vectors. No sublinear indexing (IVF, HNSW). At >100k vectors, latency grows linearly. The two-stage architecture is a natural fit for adding partition-based coarse search, or for plugging polar-embed's training-free encoding into an existing ANN index.
+- **Linear scan only (for now).** Search is brute-force dot product over all vectors. No sublinear indexing (IVF, HNSW). At >100k vectors, latency grows linearly. The two-stage architecture is a natural fit for adding partition-based coarse search, or for plugging remex's training-free encoding into an existing ANN index.
 
 - **Matryoshka nesting penalty.** Nested codebooks are ~1.2% worse than independently optimized codebooks at 4-bit, but up to ~10% worse at 2-bit. For two-stage search, the coarse pass only needs to identify the right neighborhood (not rank precisely), so the penalty is less impactful in practice.
 
@@ -103,9 +105,9 @@ polar-embed is not the best tool for every compression scenario. Here's where it
 
 ## API reference
 
-### `PolarQuantizer(d, bits=4, seed=42)`
+### `Quantizer(d, bits=4, seed=42)`
 
-Main quantizer class.
+Main quantizer class (formerly `PolarQuantizer`, which remains available as a deprecated alias).
 
 - **`d`** — Vector dimension (must match your embeddings).
 - **`bits`** — Bits per coordinate, 1-8. Sweet spot is 3-4. Use 8 for near-lossless.
@@ -127,7 +129,7 @@ Main quantizer class.
 
 ### `CompressedVectors`
 
-Container for quantized data. Created by `PolarQuantizer.encode()`.
+Container for quantized data. Created by `Quantizer.encode()`.
 
 #### Properties
 
@@ -149,7 +151,7 @@ Container for quantized data. Created by `PolarQuantizer.encode()`.
 GPU-accelerated search wrapper. Requires CuPy or PyTorch with CUDA. Falls back to NumPy.
 
 ```python
-from polar_embed.gpu import GPUSearcher
+from remex.gpu import GPUSearcher
 
 searcher = GPUSearcher(pq, compressed)                # auto-detect backend
 searcher = GPUSearcher(pq, compressed, backend="torch")  # explicit
@@ -173,8 +175,8 @@ Choose `search()` when latency matters and RAM is available. Choose `search_adc(
 ### Low-level utilities
 
 ```python
-from polar_embed import pack, unpack, packed_nbytes
-from polar_embed import lloyd_max_codebook, nested_codebooks
+from remex import pack, unpack, packed_nbytes
+from remex import lloyd_max_codebook, nested_codebooks
 ```
 
 - **`pack(indices, bits)`** / **`unpack(packed, bits, n_values)`** — Bit-pack/unpack uint8 arrays.
@@ -186,11 +188,11 @@ from polar_embed import lloyd_max_codebook, nested_codebooks
 
 ### vs TurboQuant (Zandieh et al.)
 
-TurboQuant adds QJL (quantized Johnson-Lindenstrauss) residual correction for unbiased inner product estimates. This matters for KV cache attention where unbiasedness is critical, but **hurts retrieval** — the variance from QJL outweighs the debiasing when only ranking order matters. polar-embed implements only the MSE-optimal rotation + Lloyd-Max stage, which empirically dominates for nearest-neighbor search.
+TurboQuant adds QJL (quantized Johnson-Lindenstrauss) residual correction for unbiased inner product estimates. This matters for KV cache attention where unbiasedness is critical, but **hurts retrieval** — the variance from QJL outweighs the debiasing when only ranking order matters. remex implements only the MSE-optimal rotation + Lloyd-Max stage, which empirically dominates for nearest-neighbor search.
 
 ### vs FAISS Product Quantization
 
-| | polar-embed | FAISS PQ |
+| | remex | FAISS PQ |
 |---|---|---|
 | Training | None | Required (trains on corpus) |
 | Recall at matched compression | Lower on real data | Higher (learns structure) |
@@ -202,18 +204,18 @@ TurboQuant adds QJL (quantized Johnson-Lindenstrauss) residual correction for un
 
 **Use FAISS when**: You have a stable, large corpus, need sublinear search, and can afford training time.
 
-**Use polar-embed when**: You want zero training, fast encode, frequently changing corpora, or near-lossless 8-bit caching (R@10=0.974 at 4x compression).
+**Use remex when**: You want zero training, fast encode, frequently changing corpora, or near-lossless 8-bit caching (R@10=0.974 at 4x compression).
 
 ### vs scalar quantization (naive rounding)
 
 Without the rotation step, scalar quantization on raw embeddings is catastrophically bad — embeddings are highly anisotropic (variance ratios of 10^7x across dimensions). The random rotation is what makes scalar quantization viable: it spreads information uniformly across coordinates.
 
-At 3-bit, polar-embed achieves 72-80% R@10 vs ~40% for naive scalar quantization on the same data (tested in `tests/test_polar_embed.py::TestRetrieval::test_beats_naive_at_3bit`).
+At 3-bit, remex achieves 72-80% R@10 vs ~40% for naive scalar quantization on the same data (tested in `tests/test_polar_embed.py::TestRetrieval::test_beats_naive_at_3bit`).
 
 ## Installation
 
 ```bash
-pip install polar-embed                  # from PyPI (when published)
+pip install remex                       # from PyPI (when published)
 pip install -e ".[dev]"                  # development: + pytest, pytest-cov
 pip install -e ".[bench]"               # benchmarking: + faiss-cpu, sentence-transformers
 ```

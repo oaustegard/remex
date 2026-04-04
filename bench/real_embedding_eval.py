@@ -1,8 +1,8 @@
 """
-Real embedding evaluation for PolarQuant (Issue #1).
+Real embedding evaluation for remex (formerly polar-embed, Issue #1).
 
 Encodes text with a real transformer model, then benchmarks:
-- PolarQuant recall@k at various bit widths
+- remex recall@k at various bit widths
 - FAISS Product Quantization baseline
 - Exact brute-force ground truth
 
@@ -96,13 +96,13 @@ def recall_at_k(pred, truth, k):
     return np.mean(recalls)
 
 
-def benchmark_polarquant(corpus, queries, d, bits_list, k_list):
-    """Run PolarQuant at various bit widths, report recall."""
-    from polar_embed import PolarQuantizer
+def benchmark_remex(corpus, queries, d, bits_list, k_list):
+    """Run remex at various bit widths, report recall."""
+    from remex import Quantizer
 
     results = []
     for bits in bits_list:
-        pq = PolarQuantizer(d=d, bits=bits)
+        pq = Quantizer(d=d, bits=bits)
 
         t0 = time.time()
         compressed = pq.encode(corpus)
@@ -121,7 +121,7 @@ def benchmark_polarquant(corpus, queries, d, bits_list, k_list):
         pred = np.array(all_pred)
 
         results.append({
-            "method": f"PolarQuant-{bits}bit",
+            "method": f"remex-{bits}bit",
             "bits": bits,
             "mse": mse,
             "compression_ratio": ratio,
@@ -172,7 +172,7 @@ def benchmark_faiss_pq(corpus, queries, d, m_list, k_list):
 
 def analyze_embedding_distribution(corpus, d):
     """Check if post-rotation coordinates are Gaussian (the key assumption)."""
-    from polar_embed.rotation import haar_rotation
+    from remex.rotation import haar_rotation
 
     R = haar_rotation(d, seed=42)
     norms = np.linalg.norm(corpus, axis=1)
@@ -218,10 +218,10 @@ def run_benchmark(corpus, queries, d, label, k_list=[10, 100]):
     max_k = max(k_list)
     truth = exact_knn(corpus, queries, max_k)
 
-    # PolarQuant at various bit widths
+    # remex at various bit widths
     bits_list = [2, 3, 4, 8]
-    print("\n--- PolarQuant ---")
-    pq_results = benchmark_polarquant(corpus, queries, d, bits_list, k_list)
+    print("\n--- remex ---")
+    pq_results = benchmark_remex(corpus, queries, d, bits_list, k_list)
 
     # FAISS PQ baselines (m = number of subquantizers)
     # m=48 → 48 bytes/vec, m=96 → 96 bytes/vec for d=384
@@ -262,7 +262,7 @@ if __name__ == "__main__":
     print(f"{'='*60}")
     print(f"{'':>22s} {'Real R@10':>10s} {'Rand R@10':>10s} {'Gap':>8s}")
     print("-" * 55)
-    for rr, rn in zip(real_results[:4], rand_results[:4]):  # PolarQuant only
+    for rr, rn in zip(real_results[:4], rand_results[:4]):  # remex only
         recall_real = recall_at_k(rr["pred"][:, :10], exact_knn(corpus_real, queries_real, 10), 10)
         recall_rand = recall_at_k(rn["pred"][:, :10], exact_knn(corpus_rand, queries_rand, 10), 10)
         gap = recall_real - recall_rand

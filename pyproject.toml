@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "polar-embed"
+name = "remex"
 version = "0.5.0"
 description = "Retrieval-validated embedding compression. 4-8x smaller vectors, proven recall."
 readme = "README.md"
@@ -17,7 +17,7 @@ dev = ["pytest>=7.0", "pytest-cov"]
 bench = ["faiss-cpu", "sentence-transformers"]
 
 [tool.setuptools.packages.find]
-include = ["polar_embed*"]
+include = ["remex*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

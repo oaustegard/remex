@@ -3,7 +3,7 @@
 Verifies:
 - ADC search produces identical rankings to cached search
 - search_twostage (ADC) matches old two-stage behavior
-- GPUSearcher (numpy backend) matches PolarQuantizer results
+- GPUSearcher (numpy backend) matches Quantizer results
 - Memory: ADC doesn't populate the float32 cache
 """
 
@@ -13,7 +13,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from polar_embed import PolarQuantizer, CompressedVectors
+from remex import Quantizer, CompressedVectors
 
 
 # ------------------------------------------------------------------
@@ -25,7 +25,7 @@ def setup():
     rng = np.random.default_rng(42)
     d = 128
     n = 2000
-    pq = PolarQuantizer(d=d, bits=4)
+    pq = Quantizer(d=d, bits=4)
     corpus = rng.standard_normal((n, d)).astype(np.float32)
     corpus /= np.linalg.norm(corpus, axis=1, keepdims=True)
     query = rng.standard_normal(d).astype(np.float32)
@@ -40,7 +40,7 @@ def setup_8bit():
     rng = np.random.default_rng(42)
     d = 128
     n = 2000
-    pq = PolarQuantizer(d=d, bits=8)
+    pq = Quantizer(d=d, bits=8)
     corpus = rng.standard_normal((n, d)).astype(np.float32)
     corpus /= np.linalg.norm(corpus, axis=1, keepdims=True)
     queries = [rng.standard_normal(d).astype(np.float32) for _ in range(5)]
@@ -181,13 +181,13 @@ class TestGPUSearcherNumpy:
     """Test GPUSearcher using the numpy fallback backend.
 
     This exercises the full GPUSearcher code path without a GPU.
-    Results must match PolarQuantizer exactly.
+    Results must match Quantizer exactly.
     """
 
     @pytest.fixture
     def gpu_setup(self, setup):
         pq, comp, query, corpus = setup
-        from polar_embed.gpu import GPUSearcher
+        from remex.gpu import GPUSearcher
         searcher = GPUSearcher(pq, comp, backend="numpy")
         return pq, comp, query, corpus, searcher
 
@@ -228,7 +228,5 @@ class TestGPUSearcherNumpy:
         assert searcher._x_hat_rot_gpu is None
 
     def test_available_backends_includes_numpy(self):
-        from polar_embed.gpu import available_backends
+        from remex.gpu import available_backends
         assert "numpy" in available_backends()
-
-

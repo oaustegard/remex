@@ -1,4 +1,4 @@
-"""Optional GPU acceleration for polar-embed search.
+"""Optional GPU acceleration for remex search.
 
 Moves the hot search data to GPU and runs scoring there. Falls back
 to NumPy when no GPU backend is available.
@@ -10,10 +10,10 @@ Supported backends:
 
 Usage::
 
-    from polar_embed import PolarQuantizer
-    from polar_embed.gpu import GPUSearcher
+    from remex import Quantizer
+    from remex.gpu import GPUSearcher
 
-    pq = PolarQuantizer(d=384, bits=4)
+    pq = Quantizer(d=384, bits=4)
     compressed = pq.encode(corpus)
 
     # Move to GPU — auto-detects CuPy or PyTorch
@@ -29,8 +29,8 @@ Usage::
 Design notes:
   - GPUSearcher holds GPU-resident copies of indices, norms, centroids,
     and the rotation matrix. The CompressedVectors object is not modified.
-  - search() uses the cached dequantized representation (like PolarQuantizer.search).
-  - search_adc() uses lookup-table scoring on GPU (like PolarQuantizer.search_adc).
+  - search() uses the cached dequantized representation (like Quantizer.search).
+  - search_adc() uses lookup-table scoring on GPU (like Quantizer.search_adc).
   - search_twostage() uses ADC for coarse (low memory) and materialized
     decode for fine reranking (tiny candidate set).
   - All results are returned as numpy arrays on CPU.
@@ -227,13 +227,13 @@ def _make_ops(backend: str):
 # ---------------------------------------------------------------------------
 
 class GPUSearcher:
-    """GPU-accelerated searcher wrapping a PolarQuantizer + CompressedVectors.
+    """GPU-accelerated searcher wrapping a Quantizer + CompressedVectors.
 
     Transfers quantization data to GPU once on construction. Subsequent
     search calls run on GPU with results returned as numpy arrays.
 
     Args:
-        quantizer: A PolarQuantizer instance.
+        quantizer: A Quantizer instance.
         compressed: CompressedVectors to search over.
         backend: "cupy", "torch", "numpy", or None for auto-detect.
     """

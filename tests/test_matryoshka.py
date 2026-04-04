@@ -6,8 +6,8 @@ import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from polar_embed import PolarQuantizer
-from polar_embed.codebook import nested_codebooks, lloyd_max_codebook
+from remex import Quantizer
+from remex.codebook import nested_codebooks, lloyd_max_codebook
 
 
 class TestNestedCodebooks:
@@ -53,7 +53,7 @@ class TestPrecisionParameter:
     def setup(self):
         rng = np.random.default_rng(42)
         d = 128
-        pq = PolarQuantizer(d=d, bits=4)
+        pq = Quantizer(d=d, bits=4)
         corpus = rng.standard_normal((500, d)).astype(np.float32)
         corpus = corpus / np.linalg.norm(corpus, axis=1, keepdims=True)
         query = rng.standard_normal(d).astype(np.float32)
@@ -102,7 +102,7 @@ class TestTwoStageSearch:
     def setup(self):
         rng = np.random.default_rng(42)
         d = 128
-        pq = PolarQuantizer(d=d, bits=4)
+        pq = Quantizer(d=d, bits=4)
         corpus = rng.standard_normal((1000, d)).astype(np.float32)
         corpus = corpus / np.linalg.norm(corpus, axis=1, keepdims=True)
         query = rng.standard_normal(d).astype(np.float32)
@@ -144,7 +144,7 @@ class TestSubset:
     def test_subset_correct(self):
         rng = np.random.default_rng(42)
         d = 64
-        pq = PolarQuantizer(d=d, bits=4)
+        pq = Quantizer(d=d, bits=4)
         corpus = rng.standard_normal((100, d)).astype(np.float32)
         comp = pq.encode(corpus)
         idx = np.array([5, 10, 50])

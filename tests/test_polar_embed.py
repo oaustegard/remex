@@ -1,4 +1,4 @@
-"""Tests for polar-embed.
+"""Tests for remex (formerly polar-embed).
 
 Covers: correctness, theoretical bounds, retrieval quality,
 edge cases, and distribution robustness.
@@ -6,10 +6,10 @@ edge cases, and distribution robustness.
 
 import numpy as np
 import pytest
-from polar_embed import PolarQuantizer, CompressedVectors, lloyd_max_codebook
-from polar_embed.packing import pack, unpack, packed_nbytes
-from polar_embed.rotation import haar_rotation
-from polar_embed.codebook import theoretical_mse, theoretical_lower_bound
+from remex import Quantizer, CompressedVectors, lloyd_max_codebook
+from remex.packing import pack, unpack, packed_nbytes
+from remex.rotation import haar_rotation
+from remex.codebook import theoretical_mse, theoretical_lower_bound
 
 
 # ── Fixtures ──
@@ -91,9 +91,9 @@ class TestCodebook:
 
 # ── Core quantizer tests ──
 
-class TestPolarQuantizer:
+class TestQuantizer:
     def test_encode_decode_shapes(self, unit_vectors):
-        pq = PolarQuantizer(256, bits=4)
+        pq = Quantizer(256, bits=4)
         comp = pq.encode(unit_vectors)
         assert comp.indices.shape == (10_000, 256)
         assert comp.norms.shape == (10_000,)
@@ -104,7 +104,7 @@ class TestPolarQuantizer:
         assert X_hat.dtype == np.float32
 
     def test_single_vector(self):
-        pq = PolarQuantizer(64, bits=4)
+        pq = Quantizer(64, bits=4)
         x = np.random.randn(64).astype(np.float32)
         comp = pq.encode(x)
         assert comp.n == 1
@@ -114,25 +114,25 @@ class TestPolarQuantizer:
     def test_norms_preserved(self, rng):
         """Original vector norms should be stored exactly."""
         X = rng.standard_normal((100, 128)).astype(np.float32) * 5.0
-        pq = PolarQuantizer(128, bits=4)
+        pq = Quantizer(128, bits=4)
         comp = pq.encode(X)
         true_norms = np.linalg.norm(X, axis=1)
         np.testing.assert_allclose(comp.norms, true_norms, rtol=1e-5)
 
     def test_dimension_mismatch_raises(self):
-        pq = PolarQuantizer(128, bits=4)
+        pq = Quantizer(128, bits=4)
         with pytest.raises(ValueError, match="Expected d=128"):
             pq.encode(np.zeros((10, 64)))
 
     def test_bits_validation(self):
         with pytest.raises(ValueError):
-            PolarQuantizer(128, bits=0)
+            Quantizer(128, bits=0)
         with pytest.raises(ValueError):
-            PolarQuantizer(128, bits=9)
+            Quantizer(128, bits=9)
 
     def test_deterministic(self, unit_vectors):
-        pq1 = PolarQuantizer(256, bits=4, seed=42)
-        pq2 = PolarQuantizer(256, bits=4, seed=42)
+        pq1 = Quantizer(256, bits=4, seed=42)
+        pq2 = Quantizer(256, bits=4, seed=42)
         c1 = pq1.encode(unit_vectors[:100])
         c2 = pq2.encode(unit_vectors[:100])
         np.testing.assert_array_equal(c1.indices, c2.indices)
@@ -144,14 +144,14 @@ class TestDistortion:
     @pytest.mark.parametrize("bits", [2, 3, 4])
     def test_mse_decreases_with_bits(self, unit_vectors, bits):
         """More bits should always reduce MSE."""
-        pq_lo = PolarQuantizer(256, bits=bits)
-        pq_hi = PolarQuantizer(256, bits=bits + 1)
+        pq_lo = Quantizer(256, bits=bits)
+        pq_hi = Quantizer(256, bits=bits + 1)
         assert pq_lo.mse(unit_vectors) > pq_hi.mse(unit_vectors)
 
     @pytest.mark.parametrize("bits", [2, 3, 4])
     def test_mse_below_upper_bound(self, unit_vectors, bits):
         """Empirical MSE should be within 2x of theoretical upper bound."""
-        pq = PolarQuantizer(256, bits=bits)
+        pq = Quantizer(256, bits=bits)
         empirical = pq.mse(unit_vectors)
         upper = theoretical_mse(256, bits)
         assert empirical < upper * 2.0, (
@@ -161,7 +161,7 @@ class TestDistortion:
     @pytest.mark.parametrize("bits", [2, 3, 4])
     def test_mse_above_lower_bound(self, unit_vectors, bits):
         """Empirical MSE should be above information-theoretic lower bound."""
-        pq = PolarQuantizer(256, bits=bits)
+        pq = Quantizer(256, bits=bits)
         empirical = pq.mse(unit_vectors)
         lower = theoretical_lower_bound(bits)
         assert empirical > lower * 0.5, (
@@ -179,7 +179,7 @@ def recall_at_k(true_ips, est_ips, k=10):
 
 class TestRetrieval:
     def test_search_returns_correct_shapes(self, unit_vectors, queries):
-        pq = PolarQuantizer(256, bits=4)
+        pq = Quantizer(256, bits=4)
         comp = pq.encode(unit_vectors)
         idx, scores = pq.search(comp, queries[0], k=10)
         assert idx.shape == (10,)
@@ -188,7 +188,7 @@ class TestRetrieval:
 
     def test_search_k_larger_than_n(self, rng):
         X = rng.standard_normal((5, 64)).astype(np.float32)
-        pq = PolarQuantizer(64, bits=4)
+        pq = Quantizer(64, bits=4)
         comp = pq.encode(X)
         idx, scores = pq.search(comp, rng.standard_normal(64).astype(np.float32), k=100)
         assert idx.shape == (5,)
@@ -196,7 +196,7 @@ class TestRetrieval:
     @pytest.mark.parametrize("bits,min_recall", [(2, 0.3), (3, 0.5), (4, 0.7), (8, 0.95)])
     def test_recall_at_10(self, unit_vectors, queries, bits, min_recall):
         """Recall@10 should meet minimum thresholds for random unit vectors."""
-        pq = PolarQuantizer(256, bits=bits)
+        pq = Quantizer(256, bits=bits)
         comp = pq.encode(unit_vectors)
         true_ips = unit_vectors @ queries.T
 
@@ -212,12 +212,12 @@ class TestRetrieval:
         )
 
     def test_beats_naive_at_3bit(self, unit_vectors, queries):
-        """polar-embed should beat naive minmax quantization at 3 bits."""
+        """remex should beat naive minmax quantization at 3 bits."""
         d = 256
         bits = 3
 
-        # polar-embed
-        pq = PolarQuantizer(d, bits=bits)
+        # remex
+        pq = Quantizer(d, bits=bits)
         comp = pq.encode(unit_vectors)
         X_hat_pq = pq.decode(comp)
 
@@ -236,7 +236,7 @@ class TestRetrieval:
             recall_naive.append(recall_at_k(true_ips[:, qi], X_hat_naive @ queries[qi]))
 
         assert np.mean(recall_pq) > np.mean(recall_naive), (
-            f"polar-embed recall {np.mean(recall_pq):.3f} <= "
+            f"remex recall {np.mean(recall_pq):.3f} <= "
             f"naive recall {np.mean(recall_naive):.3f}"
         )
 
@@ -245,7 +245,7 @@ class TestRetrieval:
 
 class TestSerialization:
     def test_save_load_roundtrip(self, unit_vectors, tmp_path):
-        pq = PolarQuantizer(256, bits=4)
+        pq = Quantizer(256, bits=4)
         comp = pq.encode(unit_vectors[:100])
         path = str(tmp_path / "test.npz")
         comp.save(path)
@@ -257,7 +257,7 @@ class TestSerialization:
         assert comp.bits == loaded.bits
 
     def test_compression_ratio(self, unit_vectors):
-        pq = PolarQuantizer(256, bits=4)
+        pq = Quantizer(256, bits=4)
         comp = pq.encode(unit_vectors)
         assert comp.compression_ratio > 7.0
         assert comp.compression_ratio < 8.5
@@ -276,7 +276,7 @@ class TestDistributions:
         X = rng.standard_normal((5000, d)).astype(np.float32) * scales
         X /= np.linalg.norm(X, axis=1, keepdims=True)
 
-        pq = PolarQuantizer(d, bits=4)
+        pq = Quantizer(d, bits=4)
         mse_aniso = pq.mse(X)
 
         X_iso = rng.standard_normal((5000, d)).astype(np.float32)
@@ -298,7 +298,7 @@ class TestDistributions:
         X = centers[labels] + rng.standard_normal((5000, d)).astype(np.float32) * 0.1
         X /= np.linalg.norm(X, axis=1, keepdims=True)
 
-        pq = PolarQuantizer(d, bits=4)
+        pq = Quantizer(d, bits=4)
         comp = pq.encode(X)
         X_hat = pq.decode(comp)
 
@@ -317,7 +317,7 @@ class TestPacking:
     """Tests for bit-packed index storage."""
 
     def test_pack_unpack_roundtrip_all_bits(self):
-        from polar_embed.packing import pack, unpack
+        from remex.packing import pack, unpack
         rng = np.random.default_rng(99)
         for bits in range(1, 9):
             indices = rng.integers(0, 2**bits, size=(50, 384), dtype=np.uint8)
@@ -326,7 +326,7 @@ class TestPacking:
             assert np.array_equal(indices, unpacked), f"Roundtrip failed at {bits}-bit"
 
     def test_packed_size_correct(self):
-        from polar_embed.packing import pack, packed_nbytes
+        from remex.packing import pack, packed_nbytes
         rng = np.random.default_rng(99)
         for bits in [2, 3, 4]:
             indices = rng.integers(0, 2**bits, size=(100, 384), dtype=np.uint8)
@@ -336,7 +336,7 @@ class TestPacking:
 
     def test_compressed_vectors_packing(self):
         """CompressedVectors should pack transparently."""
-        pq = PolarQuantizer(d=64, bits=4)
+        pq = Quantizer(d=64, bits=4)
         X = np.random.default_rng(0).standard_normal((100, 64)).astype(np.float32)
         comp = pq.encode(X)
 
@@ -349,7 +349,7 @@ class TestPacking:
 
     def test_save_load_packed_roundtrip(self):
         import tempfile, os
-        pq = PolarQuantizer(d=64, bits=3)
+        pq = Quantizer(d=64, bits=3)
         X = np.random.default_rng(0).standard_normal((50, 64)).astype(np.float32)
         comp = pq.encode(X)
 
@@ -367,7 +367,7 @@ class TestPacking:
 
     def test_compression_ratios_honest(self):
         """Verify compression ratios reflect actual packed storage."""
-        pq = PolarQuantizer(d=384, bits=4)
+        pq = Quantizer(d=384, bits=4)
         X = np.random.default_rng(0).standard_normal((1000, 384)).astype(np.float32)
         comp = pq.encode(X)
 
@@ -377,7 +377,7 @@ class TestPacking:
         assert 7.0 < comp.compression_ratio < 8.5
 
     def test_2bit_compression(self):
-        pq = PolarQuantizer(d=384, bits=2)
+        pq = Quantizer(d=384, bits=2)
         X = np.random.default_rng(0).standard_normal((100, 384)).astype(np.float32)
         comp = pq.encode(X)
         # 2-bit: 96 bytes indices + 4 bytes norm = 100 per vec

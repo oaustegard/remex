@@ -2,16 +2,16 @@
 
 ## Project overview
 
-**polar-embed** is a Python library for retrieval-validated embedding compression. It implements random orthogonal rotation + Lloyd-Max scalar quantization (from TurboQuant, Zandieh et al. ICLR 2026) to compress embedding vectors 2-16x with measured recall, optimized for nearest-neighbor retrieval in RAG systems.
+**remex** (formerly polar-embed) is a Python library for retrieval-validated embedding compression. It implements random orthogonal rotation + Lloyd-Max scalar quantization (from TurboQuant, Zandieh et al. ICLR 2026) to compress embedding vectors 2-16x with measured recall, optimized for nearest-neighbor retrieval in RAG systems.
 
 Key differentiator: **data-oblivious** — no training required. The quantizer is fully determined by `(dimension, bits, seed)`.
 
 ## Architecture
 
 ```
-polar_embed/
+remex/
 ├── __init__.py       # Public API, version
-├── core.py           # PolarQuantizer, CompressedVectors (main classes)
+├── core.py           # Quantizer, CompressedVectors (main classes)
 ├── codebook.py       # Lloyd-Max codebooks + Matryoshka nested tables
 ├── packing.py        # Bit-packing for sub-byte storage (1-8 bit)
 ├── rotation.py       # Haar random orthogonal rotation via QR
@@ -68,7 +68,7 @@ python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cp
 
 ## Code conventions
 
-- **NumPy-only core**: No PyTorch/CuPy dependency in `polar_embed/core.py`. GPU support is opt-in via `polar_embed/gpu.py`.
+- **NumPy-only core**: No PyTorch/CuPy dependency in `remex/core.py`. GPU support is opt-in via `remex/gpu.py`.
 - **No training**: Fully data-oblivious. The quantizer is determined by `(d, bits, seed)` alone.
 - **Honest compression**: `nbytes` property uses bit-packed sizes, not uint8. Benchmark tables report packed compression ratios.
 - **Deterministic**: Same `(d, bits, seed)` must produce identical results across runs.
@@ -82,7 +82,7 @@ python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cp
 
 3. **ADC for memory efficiency** — The lookup table `(d, 2^bits)` is tiny (~6KB for 2-bit d=384). Chunked scoring keeps temporary allocation at ~6MB regardless of corpus size.
 
-4. **GPU is a wrapper, not a fork** — `GPUSearcher` wraps `PolarQuantizer + CompressedVectors` rather than replacing them. The core stays pure NumPy.
+4. **GPU is a wrapper, not a fork** — `GPUSearcher` wraps `Quantizer + CompressedVectors` rather than replacing them. The core stays pure NumPy.
 
 ## Testing
 
@@ -94,7 +94,7 @@ python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cp
 
 ## Common tasks
 
-**Adding a new search method**: Add to `PolarQuantizer` in `core.py`, add corresponding method in `GPUSearcher` in `gpu.py`, add tests in `test_adc_gpu.py`.
+**Adding a new search method**: Add to `Quantizer` in `core.py`, add corresponding method in `GPUSearcher` in `gpu.py`, add tests in `test_adc_gpu.py`.
 
 **Changing codebook generation**: Modify `codebook.py`. Run `test_polar_embed.py::TestCodebook` and `test_matryoshka.py::TestNestedCodebooks` — they verify symmetry, monotonicity, and nesting properties.
 

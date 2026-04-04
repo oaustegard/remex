@@ -1,11 +1,11 @@
-# Integration Guide: polar-embed with pgVector
+# Integration Guide: remex with pgVector
 
-This guide shows how to use polar-embed for embedding compression in production systems backed by PostgreSQL/pgVector. Three patterns are covered, from simplest to most sophisticated.
+This guide shows how to use remex for embedding compression in production systems backed by PostgreSQL/pgVector. Three patterns are covered, from simplest to most sophisticated.
 
 ## Prerequisites
 
 ```bash
-pip install polar-embed psycopg2-binary numpy
+pip install remex psycopg2-binary numpy
 # For generating embeddings:
 pip install sentence-transformers
 ```
@@ -17,7 +17,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 ## Pattern 1: Compressed storage with Python-side search
 
-Store compressed vectors in PostgreSQL as binary blobs. All search happens in Python using polar-embed. This gives maximum compression and full control over search strategy.
+Store compressed vectors in PostgreSQL as binary blobs. All search happens in Python using remex. This gives maximum compression and full control over search strategy.
 
 **When to use**: Small-to-medium corpora (<500k vectors), memory-constrained environments, or when you want training-free compression without reindexing.
 
@@ -43,12 +43,12 @@ CREATE TABLE documents (
 import numpy as np
 import psycopg2
 from sentence_transformers import SentenceTransformer
-from polar_embed import PolarQuantizer
+from remex import Quantizer
 
 # Setup
 model = SentenceTransformer("all-MiniLM-L6-v2")
 d = model.get_sentence_embedding_dimension()  # 384
-pq = PolarQuantizer(d=d, bits=4)
+pq = Quantizer(d=d, bits=4)
 
 # Encode documents
 documents = ["First document text...", "Second document text...", ...]
@@ -78,9 +78,9 @@ conn.commit()
 ### Load and search
 
 ```python
-from polar_embed import PolarQuantizer, CompressedVectors
+from remex import Quantizer, CompressedVectors
 
-pq = PolarQuantizer(d=384, bits=4)
+pq = Quantizer(d=384, bits=4)
 
 # Load all compressed vectors from DB
 cur.execute("SELECT id, compressed_indices, compressed_norms FROM documents ORDER BY id")
@@ -114,9 +114,9 @@ result_idx, scores = pq.search_twostage(
 
 ---
 
-## Pattern 2: pgVector for coarse retrieval, polar-embed for reranking
+## Pattern 2: pgVector for coarse retrieval, remex for reranking
 
-Store full-precision embeddings in pgVector for coarse kNN search, then use polar-embed's compressed representation for fast reranking or caching. This combines pgVector's indexing (IVFFlat/HNSW) with polar-embed's compression.
+Store full-precision embeddings in pgVector for coarse kNN search, then use remex's compressed representation for fast reranking or caching. This combines pgVector's indexing (IVFFlat/HNSW) with remex's compression.
 
 **When to use**: Large corpora (>500k vectors), when you need sublinear search, or when pgVector is already in your stack.
 
@@ -139,7 +139,7 @@ CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops)
 ```python
 import numpy as np
 import psycopg2
-from polar_embed import PolarQuantizer, CompressedVectors
+from remex import Quantizer, CompressedVectors
 
 # Step 1: pgVector coarse retrieval (sublinear via HNSW)
 query_embedding = model.encode("search query").astype(np.float32)
@@ -154,9 +154,9 @@ cur.execute(
 )
 candidates = cur.fetchall()
 
-# Step 2: polar-embed compressed reranking
+# Step 2: remex compressed reranking
 candidate_embeddings = np.array([row[2] for row in candidates], dtype=np.float32)
-pq = PolarQuantizer(d=384, bits=8)  # 8-bit for high-quality rerank
+pq = Quantizer(d=384, bits=8)  # 8-bit for high-quality rerank
 compressed = pq.encode(candidate_embeddings)
 rerank_idx, scores = pq.search(compressed, query_embedding, k=10)
 
@@ -167,7 +167,7 @@ This pattern is useful when you want to apply custom scoring logic, combine mult
 
 ---
 
-## Pattern 3: In-app embedding cache with polar-embed
+## Pattern 3: In-app embedding cache with remex
 
 Keep a compressed in-memory cache of your most-accessed embeddings, backed by PostgreSQL for persistence. Queries hit the cache first; cache misses fall through to the database.
 
@@ -176,7 +176,7 @@ Keep a compressed in-memory cache of your most-accessed embeddings, backed by Po
 ### Architecture
 
 ```
-Query → In-memory cache (polar-embed compressed)
+Query → In-memory cache (remex compressed)
           ↓ cache miss
         PostgreSQL (pgVector full embeddings)
           ↓ result
@@ -188,14 +188,14 @@ Query → In-memory cache (polar-embed compressed)
 ```python
 import numpy as np
 import time
-from polar_embed import PolarQuantizer, CompressedVectors
+from remex import Quantizer, CompressedVectors
 
 
 class EmbeddingCache:
     """In-memory compressed embedding cache backed by PostgreSQL."""
 
     def __init__(self, d: int, bits: int = 8, max_size: int = 100_000):
-        self.pq = PolarQuantizer(d=d, bits=bits)
+        self.pq = Quantizer(d=d, bits=bits)
         self.d = d
         self.max_size = max_size
 
@@ -338,4 +338,4 @@ doc_ids, scores = cache.search_low_memory(query_embedding, k=10)
 - **Start with 8-bit** (R@10=0.98, 4x compression). Drop to 4-bit only if you need more compression and can tolerate R@10~0.85.
 - **Use `search_twostage()` for large corpora**: At 100k+ vectors, ADC two-stage gives the same recall as cached search at 5x less RAM.
 - **Save/load for persistence**: `compressed.save("index.npz")` / `CompressedVectors.load("index.npz")` uses bit-packed format. Smaller than storing uint8 in the DB.
-- **Deterministic quantizer**: `PolarQuantizer(d=384, bits=4, seed=42)` produces identical results everywhere. No need to ship a trained index — just agree on the parameters.
+- **Deterministic quantizer**: `Quantizer(d=384, bits=4, seed=42)` produces identical results everywhere. No need to ship a trained index — just agree on the parameters.

@@ -1,10 +1,10 @@
-"""Core polar-embed encoder/decoder with Matryoshka bit precision."""
+"""Core remex encoder/decoder with Matryoshka bit precision."""
 
 import numpy as np
 from typing import Optional, Tuple
-from polar_embed.codebook import lloyd_max_codebook, nested_codebooks
-from polar_embed.packing import pack, unpack, packed_nbytes
-from polar_embed.rotation import haar_rotation
+from remex.codebook import lloyd_max_codebook, nested_codebooks
+from remex.packing import pack, unpack, packed_nbytes
+from remex.rotation import haar_rotation
 
 
 class CompressedVectors:
@@ -91,7 +91,7 @@ class CompressedVectors:
         return cls(indices, data["norms"], d, bits)
 
 
-class PolarQuantizer:
+class Quantizer:
     """
     Vector quantizer with Matryoshka bit precision.
 

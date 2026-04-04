@@ -1,5 +1,5 @@
 """
-Self-contained benchmark for polar-embed.
+Self-contained benchmark for remex (formerly polar-embed).
 
 Uses synthetic embeddings that mimic real embedding characteristics
 (clustered structure, anisotropy) so benchmarks run without
@@ -16,8 +16,8 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from polar_embed import PolarQuantizer
-from polar_embed.rotation import haar_rotation
+from remex import Quantizer
+from remex.rotation import haar_rotation
 
 
 def make_clustered_embeddings(n, d, n_clusters=20, seed=42):
@@ -55,7 +55,7 @@ def run_benchmark():
     n_queries = 200
 
     print("=" * 70)
-    print("polar-embed benchmark")
+    print("remex benchmark")
     print("=" * 70)
 
     for n_corpus in [1_000, 5_000, 10_000, 50_000]:
@@ -72,7 +72,7 @@ def run_benchmark():
         print("-" * len(header))
 
         for bits in [2, 3, 4, 8]:
-            pq = PolarQuantizer(d=d, bits=bits)
+            pq = Quantizer(d=d, bits=bits)
 
             # Encode
             t0 = time.perf_counter()
@@ -94,11 +94,11 @@ def run_benchmark():
             r10 = recall_at_k(pred, truth10, 10)
             r100 = recall_at_k(pred, truth100, 100)
 
-            label = f"PolarQuant {bits}-bit (oblivious)"
+            label = f"remex {bits}-bit (oblivious)"
             print(f"{label:<35s} {ratio:>5.1f}x {mse:>10.4f} {r10:>7.3f} {r100:>7.3f} {enc_ms:>7.0f} {search_ms:>7.0f}")
 
         # Two-stage search (Matryoshka)
-        pq = PolarQuantizer(d=d, bits=4)
+        pq = Quantizer(d=d, bits=4)
         compressed = pq.encode(corpus)
 
         all_pred = []
@@ -110,7 +110,7 @@ def run_benchmark():
         pred = np.array(all_pred)
         r10 = recall_at_k(pred, truth10, 10)
 
-        label = "PolarQuant 4-bit (two-stage)"
+        label = "remex 4-bit (two-stage)"
         print(f"{label:<35s} {compressed.compression_ratio:>5.1f}x {'':>10s} {r10:>7.3f} {'':>7s} {'':>8s} {search_ms:>7.0f}")
 
     # Distribution analysis
