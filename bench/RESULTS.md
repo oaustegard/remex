@@ -1,81 +1,111 @@
-# Real Embedding Evaluation Results
+# Benchmark Results
 
-**Date**: 2026-04-02  
-**Model**: all-MiniLM-L6-v2 (d=384)  
-**Corpus**: 10,000 vectors | **Queries**: 500  
+**Date**: 2026-04-05
+**Library version**: remex 0.5.0
+**Hardware**: CPU (NumPy), no GPU
+**Seeds**: corpus seed=42, query seed=99, quantizer seed=42
 
-## Distribution Analysis (Post-Rotation)
+## Synthetic Benchmarks (d=384, 20 clusters, spread=0.3)
 
-| Metric | Real Embeddings | Random Vectors |
-|--------|----------------|----------------|
-| Expected σ (1/√d) | 0.051031 | 0.051031 |
-| Actual σ (global) | 0.051018 | 0.051027 |
-| Per-dim σ (mean±std) | 0.0437 ± 0.0056 | 0.0510 ± 0.0004 |
-| Kurtosis (Gaussian=3) | 2.72 ± 0.45 | 2.98 ± 0.05 |
-| Original anisotropy | 37M× | 1.1× |
+### Recall vs bit level (10k corpus, 200 queries)
 
-**Key finding**: The rotation trick works — global σ matches theory perfectly. But per-dimension variance spans ~0.03–0.06, indicating residual structure the rotation doesn't fully eliminate.
+| Method | Compression | MSE | R@10 | R@100 | Encode (ms) | Search (ms) |
+|--------|------------|-----|------|-------|-------------|-------------|
+| remex 2-bit | 15.4x | 0.1171 | 0.538 | 0.634 | 79 | 21 |
+| remex 3-bit | 10.4x | 0.0343 | 0.719 | 0.800 | 153 | 22 |
+| remex 4-bit | 7.8x | 0.0094 | 0.850 | 0.895 | 134 | 21 |
+| remex 8-bit | 4.0x | 0.0000 | 0.987 | 0.991 | 238 | 21 |
 
-## Recall Results: Real Embeddings
+### Scaling with corpus size (4-bit)
 
-| Method | Compression* | MSE | R@10 | R@100 |
-|--------|-------------|-----|------|-------|
-| PolarQuant 2-bit | 16× | 0.1164 | 0.517 | 0.860 |
-| PolarQuant 3-bit | 10.4× | 0.0341 | 0.599 | 0.897 |
-| PolarQuant 4-bit | 7.8× | 0.0093 | 0.707 | 0.932 |
-| PolarQuant 8-bit | 2.0× | 0.0000 | 0.974 | 0.995 |
-| FAISS PQ (m=48) | 32× | 0.0636 | 0.618 | 0.877 |
-| FAISS PQ (m=96) | 16× | 0.0341 | 0.816 | 0.946 |
+| Corpus | R@10 | R@100 | Encode (ms) | Search (ms) |
+|--------|------|-------|-------------|-------------|
+| 1k | 0.880 | 0.930 | 12 | 4 |
+| 5k | 0.862 | 0.905 | 63 | 13 |
+| 10k | 0.850 | 0.895 | 134 | 21 |
+| 50k | 0.839 | 0.872 | 689 | 140 |
 
-*PolarQuant compression uses bit-packing for on-disk storage. In-memory indices use uint8 for fast search.
+### Two-stage search (4-bit Matryoshka, 200 candidates)
 
-## Recall Results: Random Unit Vectors
+| Corpus | R@10 | Search (ms) |
+|--------|------|-------------|
+| 1k | 0.880 | 343 |
+| 5k | 0.861 | 1535 |
+| 10k | 0.849 | 2894 |
+| 50k | 0.837 | 14156 |
 
-| Method | MSE | R@10 | R@100 |
-|--------|-----|------|-------|
-| PolarQuant 2-bit | 0.1170 | 0.533 | 0.634 |
-| PolarQuant 3-bit | 0.0344 | 0.740 | 0.799 |
-| PolarQuant 4-bit | 0.0094 | 0.847 | 0.895 |
-| PolarQuant 8-bit | 0.0000 | 0.986 | 0.991 |
-| FAISS PQ (m=48) | 0.2875 | 0.280 | 0.390 |
-| FAISS PQ (m=96) | 0.0863 | 0.484 | 0.587 |
+Two-stage recall matches single-stage to within 0.5%, validating the Matryoshka coarse-to-fine approach.
 
-## Analysis
+### Distribution sensitivity (10k corpus, 200 queries, varying cluster tightness)
 
-### The Recall Gap
-PolarQuant loses 14% R@10 at 3-4 bits on real vs random embeddings. This is **not** because the Gaussian assumption breaks — the global distribution fits perfectly. The gap comes from:
+| Spread (σ) | 2-bit R@10 | 3-bit R@10 | 4-bit R@10 | 8-bit R@10 |
+|-----------|-----------|-----------|-----------|-----------|
+| 0.01 | 0.163 | 0.331 | 0.533 | 0.954 |
+| 0.05 | 0.478 | 0.693 | 0.831 | 0.984 |
+| 0.10 | 0.532 | 0.727 | 0.846 | 0.987 |
+| 0.30 | 0.538 | 0.719 | 0.850 | 0.987 |
+| 0.50 | 0.540 | 0.717 | 0.859 | 0.986 |
+| 1.00 | 0.525 | 0.720 | 0.848 | 0.984 |
 
-1. **Data clustering**: Real embeddings form tight clusters (20 topics). Within-cluster inner products are high, so quantization errors have outsized impact on ranking.
-2. **Per-dimension heterogeneity**: σ varies 2× across dimensions (0.03–0.06). The uniform codebook over-quantizes low-variance dims and under-quantizes high-variance ones.
+**Key finding**: Very tight clusters (σ=0.01) severely degrade recall at all bit levels below 8. At 4-bit, R@10 drops from 0.85 to 0.53 — a 37% loss. At 8-bit, the degradation is only 3%. This is because tight clusters create near-identical vectors where small quantization errors flip rankings.
 
-### FAISS PQ: Opposite Pattern
-FAISS PQ dramatically *improves* on real embeddings vs random (0.618 vs 0.280 at m=48). It trains on the data, learning subspace structure that random vectors don't have. This is the fundamental trade-off: data-oblivious (PolarQuant) vs data-adaptive (FAISS PQ).
+### Post-rotation distribution analysis (10k vectors, d=384)
 
-### Fitted Codebook: No Help
-Fitting Lloyd-Max to the actual global σ instead of theoretical σ produced zero improvement (σ was already correct to 4 decimal places). Per-dimension codebooks are the next experiment.
+| Metric | Value |
+|--------|-------|
+| Expected σ (1/√d) | 0.051031 |
+| Actual σ (global) | 0.051031 |
+| Per-dim σ (mean±std) | 0.0510 ± 0.0004 |
+| Kurtosis (Gaussian=3) | 2.98 ± 0.05 |
+| σ range | [0.0495, 0.0525] |
 
-### Practical Comparison at Matched Compression
-| Method | Compression | R@10 |
-|--------|------------|------|
-| PolarQuant 3-bit | ~10× | 0.599 |
-| FAISS PQ (m=96) | 16× | 0.816 |
+The rotation produces near-perfect N(0, 1/d) coordinates on synthetic data.
 
-FAISS wins convincingly at the compression points practitioners care about.
+## Real Embedding Benchmarks (all-MiniLM-L6-v2, d=384)
 
-## Conclusions for Issue #1
+From `bench/real_embedding_eval.py` using 10k corpus and 500 queries encoded by sentence-transformers:
 
-**Acceptance criterion**: R@10 at 4-bit within 10% of random → **NOT MET** (0.707 vs 0.847 = 17% gap)
+| Method | Compression | MSE | R@10 | R@100 |
+|--------|------------|-----|------|-------|
+| remex 2-bit | 16x | 0.1164 | 0.517 | 0.860 |
+| remex 3-bit | 10.4x | 0.0341 | 0.599 | 0.897 |
+| remex 4-bit | 7.8x | 0.0093 | 0.707 | 0.932 |
+| remex 8-bit | 2.0x | 0.0000 | 0.974 | 0.995 |
+| FAISS PQ (m=96, trained) | 16x | 0.0341 | 0.816 | 0.946 |
+| FAISS PQ (m=48, trained) | 32x | 0.0636 | 0.618 | 0.877 |
 
-**But the framing was wrong**. Random vectors are the *hardest* case for FAISS PQ (no structure to exploit) and the *easiest* for PolarQuant (coordinates are already perfectly Gaussian). Real embeddings flip both directions.
+**Real vs synthetic gap**: 4-bit R@10 drops from 0.85 (synthetic) to 0.707 (real). Real embeddings cluster by topic, amplifying quantization errors within tight clusters.
 
-**PolarQuant's lane**:
-- Training-free, deterministic, portable (no index to ship)
-- 8-bit is near-lossless (R@10=0.974) at 2× compression — good for caching
-- 4-bit is serviceable (R@10=0.707) for coarse retrieval with reranking
-- Not competitive with data-adaptive methods at aggressive compression
+## Memory Profiles (100k vectors, d=384, 8-bit)
 
-**Next steps**:
-- [ ] Per-dimension codebooks (fit σ_j per coordinate)
-- [ ] Bit-packing (issue #4) for honest compression numbers
-- [ ] Larger/more diverse corpus (current 20-topic set may overstate clustering effect)
-- [ ] Blog post: "QJL hurts retrieval" + honest PolarQuant positioning
+| Strategy | Resident RAM | ms/query |
+|----------|-------------|----------|
+| CompressedVectors (no cache) | 38.8 MB | — |
+| CompressedVectors (cached) | 192.4 MB | 3.9 |
+| CompressedVectors (cold) | 38.8 MB | 137 |
+| PackedVectors (always packed) | 38.8 MB | — |
+| search_adc() (no cache) | 38.8 MB | 152 |
+| search_twostage() (no cache) | 38.8 MB | 152 |
+
+## Compression Ratios (bit-packed, d=384)
+
+| Bits | Bytes per vector | vs float32 | File size per 10k vectors |
+|------|-----------------|------------|--------------------------|
+| 2 | 100 | 15.4x | 0.93 MB |
+| 3 | 148 | 10.4x | 1.42 MB |
+| 4 | 196 | 7.8x | 1.83 MB |
+| 8 | 388 | 4.0x | 3.61 MB |
+
+Float32 baseline: 1,536 bytes/vector, 15.36 MB per 10k vectors.
+
+## Reproducibility
+
+All benchmarks can be reproduced with:
+
+```bash
+python bench/benchmark.py               # synthetic data (no extra deps)
+pip install -e ".[bench]"               # for real embedding benchmarks
+python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cpu
+```
+
+Seeds: corpus generation uses `np.random.default_rng(42)`, queries use seed 99, quantizer uses seed 42.

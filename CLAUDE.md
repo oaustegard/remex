@@ -20,11 +20,14 @@ remex/
 tests/
 ├── test_polar_embed.py   # Core: rotation, codebook, quantizer, retrieval, packing
 ├── test_matryoshka.py    # Nested codebooks, precision parameter, two-stage search, subset
-└── test_adc_gpu.py       # ADC search, memory accounting, GPUSearcher (numpy fallback)
+├── test_adc_gpu.py       # ADC search, memory accounting, GPUSearcher (numpy fallback)
+��── test_packed_vectors.py # PackedVectors creation, unpacking, ADC, serialization
+└── test_coverage_gaps.py  # Edge cases, save/load all bits, subset search
 
 bench/
 ├── benchmark.py          # Self-contained benchmark (no external deps)
-└── real_embedding_eval.py  # Real embeddings benchmark (needs sentence-transformers, faiss)
+├── real_embedding_eval.py  # Real embeddings benchmark (needs sentence-transformers, faiss)
+└── RESULTS.md            # Benchmark results with distribution sensitivity analysis
 ```
 
 ### Data flow
@@ -54,7 +57,7 @@ Search:
 
 ```bash
 pip install -e ".[dev]"    # numpy, scipy, pytest, pytest-cov
-pytest                      # 88 tests, ~5 min
+pytest                      # 126 tests, ~6 min
 pytest tests/test_adc_gpu.py -v  # just ADC/GPU tests, ~30s
 ```
 
