@@ -76,6 +76,34 @@ From `bench/real_embedding_eval.py` using 10k corpus and 500 queries encoded by 
 
 **Real vs synthetic gap**: 4-bit R@10 drops from 0.85 (synthetic) to 0.707 (real). Real embeddings cluster by topic, amplifying quantization errors within tight clusters.
 
+## SPECTER2 Scientific Embeddings (allenai/specter2_base, d=768)
+
+From `bench/specter2_eval.py` using 1k papers per partition, 500 queries (random split). Papers fetched from Semantic Scholar API, encoded locally with SPECTER2.
+
+### Post-rotation distribution analysis
+
+| Metric | Broad (NLP) | Narrow (Transformer) | Expected |
+|--------|------------|---------------------|----------|
+| Per-coord σ mean | 0.0140 | 0.0138 | 0.0361 |
+| σ ratio (actual/expected) | 0.389 | 0.381 | 1.000 |
+| Excess kurtosis | 0.005 | -0.050 | 0.000 |
+| KS rejections (α=0.05) | 20/20 | 20/20 | ~1/20 |
+
+The Gaussian assumption does not hold: per-coordinate σ is only 38% of expected. However, both broad and narrow partitions show identical deviation — domain specificity does not matter.
+
+### Recall
+
+| Bits | Compression | Broad R@10 | Broad R@100 | Narrow R@10 | Narrow R@100 |
+|------|------------|-----------|------------|------------|-------------|
+| 2 | 15.7x | 0.630 | 0.783 | 0.688 | 0.797 |
+| 3 | 10.5x | 0.714 | 0.838 | 0.767 | 0.864 |
+| 4 | 7.9x | 0.834 | 0.910 | 0.859 | 0.923 |
+| 8 | 4.0x | 0.989 | 0.994 | 0.988 | 0.993 |
+
+Despite the 61% σ deviation, 4-bit R@10 > 0.83 and 8-bit is essentially lossless. SPECTER2 4-bit recall (0.834) is notably higher than MiniLM (0.707), likely due to higher dimensionality (768 vs 384) providing more quantization budget.
+
+See [docs/specter2-case-study.md](../docs/specter2-case-study.md) for full analysis.
+
 ## Memory Profiles (100k vectors, d=384, 8-bit)
 
 | Strategy | Resident RAM | ms/query |
