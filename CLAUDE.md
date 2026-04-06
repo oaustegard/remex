@@ -21,7 +21,7 @@ tests/
 ├── test_polar_embed.py   # Core: rotation, codebook, quantizer, retrieval, packing
 ├── test_matryoshka.py    # Nested codebooks, precision parameter, two-stage search, subset
 ├── test_adc_gpu.py       # ADC search, memory accounting, GPUSearcher (numpy fallback)
-��── test_packed_vectors.py # PackedVectors creation, unpacking, ADC, serialization
+├── test_packed_vectors.py # PackedVectors creation, unpacking, ADC, serialization
 └── test_coverage_gaps.py  # Edge cases, save/load all bits, subset search
 
 bench/
