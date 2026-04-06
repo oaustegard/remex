@@ -2,8 +2,6 @@
 
 Retrieval-validated embedding compression. 2-16x smaller vectors with measured recall.
 
-> Formerly known as **polar-embed**.
-
 Based on the rotation + Lloyd-Max scalar quantization insight from [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., ICLR 2026), focused on the use case that matters most: **embedding storage and retrieval for RAG systems**.
 
 ## Quick start
