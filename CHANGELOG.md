@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## v0.7.0 — 2026-09-11
+
+Five weeks since v0.6.0 (2026-08-04), from six pull requests.
+
+Two of the entries below came from reading RSLM
+([arXiv 2608.30384](https://arxiv.org/abs/2608.30384)) against this codebase in
+September. RSLM stores a scale so that the reconstructed vector's norm is right;
+checking why remex did not need one showed that it did. The decoded direction is
+not unit length, so `norms * u_hat` had been about 1% long or short, by a
+different amount per vector, in every release so far. RSLM's other main claim,
+encoding a residual against a partition centroid, arrives here in the form the
+data-oblivious design allows: one caller-supplied corpus mean. Both land without
+a format change or a stored byte, and `renorm` is on by default, so upgrading
+changes what `search` returns.
+
+Scalar mode and `rotation="none"` are unrelated and merged in August.
 
 ### Added
 
