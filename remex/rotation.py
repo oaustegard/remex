@@ -206,11 +206,15 @@ def rht_rotation(d: int, seed: int = 42) -> np.ndarray:
     option here.  Materialized by applying the transform to the identity, one
     batched pass.
 
+    ``Quantizer(rotation="rht")`` does not apply this matrix: it applies the
+    same transform through ``RHTOperator`` below, and builds this matrix only
+    when ``Quantizer.R`` is read (``gpu.py``, ``save_params``).
+
     The Mojo port implements the same construction, off the same NumPy PCG64
     stream (``mojo/src/rotation.mojo::rht_rotation``), so ``polarquant
-    --seed S --rotation rht`` rebuilds this matrix byte-for-byte and encodes
-    identically.  ``--params`` works too, and reads R straight out of the
-    file.
+    --seed S --rotation rht`` rebuilds this matrix byte-for-byte.  It encodes
+    through the matrix, so its codes match the operator's to float32
+    rounding rather than bit for bit.
 
     Args:
         d: Matrix dimension.
@@ -286,8 +290,16 @@ def set_num_threads(n) -> None:
     _num_threads = None if n is None else max(1, int(n))
 
 
+_default_threads_cache = None
+
+
 def get_num_threads() -> int:
-    return _num_threads if _num_threads is not None else _default_threads()
+    global _default_threads_cache
+    if _num_threads is not None:
+        return _num_threads
+    if _default_threads_cache is None:
+        _default_threads_cache = _default_threads()
+    return _default_threads_cache
 
 
 def _executor(workers: int):
@@ -342,6 +354,9 @@ def _numpy_fwht_rows(Y: np.ndarray, B: int) -> np.ndarray:
     return V.reshape(n, d)
 
 
+_FLOAT_DTYPES = (np.dtype(np.float32), np.dtype(np.float64))
+
+
 class RHTOperator:
     """``rht_rotation(d, seed)`` applied without materializing it.
 
@@ -355,6 +370,7 @@ class RHTOperator:
     def __init__(self, d: int, seed: int = 42):
         self.d = int(d)
         self.seed = seed
+        self._kernel = None  # resolved on first apply: kernel, or False for NumPy
         B, rounds, perms, signs = rht_plan(self.d, seed)
         self.B, self.rounds, self.perms = B, rounds, perms
         inv_sqrt = 1.0 / math.sqrt(B)
@@ -364,6 +380,10 @@ class RHTOperator:
             np.dtype(np.float64): np.ascontiguousarray(
                 np.stack([s.astype(np.float64) * inv_sqrt for s in signs]), dtype=np.float64),
         }
+
+        self._perms_ptr = self.perms.ctypes.data
+        self._ptrs_f32 = self._ss[_FLOAT_DTYPES[0]].ctypes.data
+        self._ptrs_f64 = self._ss[_FLOAT_DTYPES[1]].ctypes.data
 
     @property
     def nbytes(self) -> int:
@@ -388,16 +408,27 @@ class RHTOperator:
 
     # -- internals --------------------------------------------------------
     def _apply(self, X, mode: int) -> np.ndarray:
-        X = np.asarray(X)
-        if X.dtype not in (np.float32, np.float64):
-            X = X.astype(np.float32)
-        one = X.ndim == 1
-        X2 = np.ascontiguousarray(X.reshape(1, -1) if one else X)
-        if X2.ndim != 2 or X2.shape[1] != self.d:
+        if not (type(X) is np.ndarray and X.dtype in _FLOAT_DTYPES
+                and X.flags.c_contiguous):
+            X = np.asarray(X)
+            if X.dtype not in _FLOAT_DTYPES:
+                X = X.astype(np.float32)
+            X = np.ascontiguousarray(X)
+        if X.ndim == 1:
+            if X.shape[0] != self.d:
+                raise ValueError(f"Expected d={self.d}, got shape {X.shape}")
+            return self._apply2(X.reshape(1, self.d), mode)[0]
+        if X.ndim != 2 or X.shape[1] != self.d:
             raise ValueError(f"Expected d={self.d}, got shape {X.shape}")
-        k = _native_kernel()
-        out = self._apply_native(k, X2, mode) if k is not None else self._apply_numpy(X2, mode)
-        return out[0] if one else out
+        return self._apply2(X, mode)
+
+    def _apply2(self, X: np.ndarray, mode: int) -> np.ndarray:
+        k = self._kernel
+        if k is None:
+            k = self._kernel = _native_kernel() or False
+        if k is False:
+            return self._apply_numpy(X, mode)
+        return self._apply_native(k, X, mode)
 
     def _apply_numpy(self, X: np.ndarray, mode: int) -> np.ndarray:
         ss = self._ss[X.dtype]
@@ -415,18 +446,18 @@ class RHTOperator:
         return Y
 
     def _apply_native(self, k, X: np.ndarray, mode: int) -> np.ndarray:
-        fn = k.f32 if X.dtype == np.float32 else k.f64
-        ss = self._ss[X.dtype]
+        f32 = X.dtype == _FLOAT_DTYPES[0]
+        fn = k.f32 if f32 else k.f64
+        ptrs = self._ptrs_f32 if f32 else self._ptrs_f64
         n, d = X.shape
         out = np.empty_like(X)
-        args = (d, self.B, self.rounds, self.perms.ctypes.data, ss.ctypes.data, mode)
+        args = (d, self.B, self.rounds, self._perms_ptr, ptrs, mode)
         xp, op = X.ctypes.data, out.ctypes.data
-        threads = get_num_threads()
-        if threads <= 1 or n < 2 or n * d < PARALLEL_MIN_FLOATS:
+        if n < 2 or n * d < PARALLEL_MIN_FLOATS or get_num_threads() <= 1:
             buf = np.empty(d, X.dtype)
             fn(xp, op, 0, n, *args, buf.ctypes.data)
             return out
-        threads = min(threads, n)
+        threads = min(get_num_threads(), n)
         step = -(-n // threads)
 
         def work(lo):

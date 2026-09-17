@@ -629,13 +629,16 @@ class Quantizer:
                 Bit-reproducible against the Mojo port (#40). O(d^3) to build:
                 measured 1.8 s at d=768, 11.4 s at d=1536, 150 s at d=3072.
 
-            "rht" — randomized Hadamard, O(d^2 log d) to build: 0.4 s at
-                d=768, 5.7 s at d=3072 (26x faster). Measured
+            "rht" — randomized Hadamard, applied in operator form
+                (`remex.rotation.RHTOperator`): O(d log d) per row, a few KB
+                of state, and no d x d matrix unless `R` is read. Measured
                 indistinguishable from Haar on retrieval recall
                 (-0.0001 +/- 0.0013 pooled over 3 corpora x 6 bit widths x
-                5 seeds, oaustegard/experiments#11). Bit-reproducible against
-                the Mojo port via `polarquant --rotation rht`. Requires an
-                even d.
+                5 seeds, oaustegard/experiments#11). Its codes are identical
+                on every machine measured (x86, ARM, Apple Silicon), which
+                Haar's dense matmul does not give. The Mojo port applies the
+                dense matrix, so its codes can differ from Python's in about
+                1e-6 of coordinates. Requires an even d.
 
             "none" — no rotation (the identity). Only sensible together with
                 `normalize=False`, where the caller has already conditioned

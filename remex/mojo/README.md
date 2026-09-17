@@ -116,7 +116,7 @@ provides those two ways:
 | Flag | Source of (R, codebook) | Bit-identical to the matching Python `Quantizer`? |
 |---|---|---|
 | `--seed S` *(default RNG: numpy, rotation: haar)* | Computed in Mojo from S via PCG64 + SeedSequence + Ziggurat + Householder QR + Lloyd-Max | **Yes**, at 1–4 bits. **8-bit:** see caveat below. |
-| `--seed S --rotation rht` | Computed in Mojo from S via PCG64 + SeedSequence + permute/sign/FWHT + Lloyd-Max | **Yes**, vs `Quantizer(..., rotation="rht")`, same bit-width caveat. |
+| `--seed S --rotation rht` | Computed in Mojo from S via PCG64 + SeedSequence + permute/sign/FWHT + Lloyd-Max | **R: yes.** Codes: Python now applies `rht` in operator form and takes boundaries from float32 centroids, while this port encodes through the dense matrix, so about 1e-6 of coordinates can differ. Porting `RHTOperator` would restore exact parity. |
 | `--seed S --rng xoshiro` | Computed in Mojo from S via xoshiro256++ + Marsaglia + Householder QR + Lloyd-Max | **No.** Both Haar samples but from different Gaussian streams. Faster init, no Ziggurat tables. |
 | `--params P.bin` | Loaded from a file written by `remex.save_params(quantizer, P)` | **Yes**, at all bit widths and for either rotation. |
 
