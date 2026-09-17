@@ -206,11 +206,15 @@ def rht_rotation(d: int, seed: int = 42) -> np.ndarray:
     option here.  Materialized by applying the transform to the identity, one
     batched pass.
 
+    ``Quantizer(rotation="rht")`` does not apply this matrix: it applies the
+    same transform through ``RHTOperator`` below, and builds this matrix only
+    when ``Quantizer.R`` is read (``gpu.py``, ``save_params``).
+
     The Mojo port implements the same construction, off the same NumPy PCG64
     stream (``mojo/src/rotation.mojo::rht_rotation``), so ``polarquant
-    --seed S --rotation rht`` rebuilds this matrix byte-for-byte and encodes
-    identically.  ``--params`` works too, and reads R straight out of the
-    file.
+    --seed S --rotation rht`` rebuilds this matrix byte-for-byte.  It encodes
+    through the matrix, so its codes match the operator's to float32
+    rounding rather than bit for bit.
 
     Args:
         d: Matrix dimension.
@@ -239,3 +243,231 @@ def rht_rotation(d: int, seed: int = 42) -> np.ndarray:
         _fwht_inplace(Y)
         Y = Y.reshape(d, d) * scale
     return Y
+
+
+# ── Operator form of the randomized Hadamard rotation ────────────────────
+#
+# ``rht_rotation`` above materializes the transform so that every consumer
+# sees an ordinary matrix. ``RHTOperator`` applies the same transform
+# directly: O(d log d) per row instead of O(d^2), a few kilobytes of state
+# instead of d^2 floats, and output that is bit-identical on every machine
+# (gathers, multiplies and pairwise add/sub only, in a fixed order). The
+# dense matrix and the operator agree to float32 rounding (~3e-6); codes
+# computed through them agree on all but ~1e-6 of coordinates.
+#
+# Measured against dense BLAS on x86, ARM and Apple Silicon:
+# oaustegard/experiments rht-operator-native/RESULTS.md.
+
+import os as _os
+import threading as _threading
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+#: Rows are split across threads only when a call carries at least this many
+#: input floats; below it, waking a thread costs more than it saves.
+#: Override with ``REMEX_PARALLEL_MIN``.
+PARALLEL_MIN_FLOATS = int(_os.environ.get("REMEX_PARALLEL_MIN", 1 << 15))
+
+_num_threads = None
+_pool = None
+_pool_pid = None
+_pool_lock = _threading.Lock()
+
+
+def _default_threads() -> int:
+    env = _os.environ.get("REMEX_NUM_THREADS")
+    if env:
+        return max(1, int(env))
+    try:
+        return max(1, len(_os.sched_getaffinity(0)))
+    except AttributeError:  # macOS, Windows
+        return max(1, _os.cpu_count() or 1)
+
+
+def set_num_threads(n) -> None:
+    """Threads used by the RHT operator. ``None`` restores the default
+    (``REMEX_NUM_THREADS``, else the CPUs this process may run on)."""
+    global _num_threads
+    _num_threads = None if n is None else max(1, int(n))
+
+
+_default_threads_cache = None
+
+
+def get_num_threads() -> int:
+    global _default_threads_cache
+    if _num_threads is not None:
+        return _num_threads
+    if _default_threads_cache is None:
+        _default_threads_cache = _default_threads()
+    return _default_threads_cache
+
+
+def _executor(workers: int):
+    """A per-process pool. A forked child gets a fresh one: the parent's
+    worker threads do not exist there, and submitting to them would hang."""
+    global _pool, _pool_pid
+    pid = _os.getpid()
+    with _pool_lock:
+        if _pool is None or _pool_pid != pid or _pool._max_workers != workers:
+            _pool = _ThreadPoolExecutor(max_workers=workers,
+                                        thread_name_prefix="remex-rht")
+            _pool_pid = pid
+        return _pool
+
+
+def rht_plan(d: int, seed: int = 42):
+    """The seed-derived structure of ``rht_rotation(d, seed)``.
+
+    Draws from the same PCG64 stream in the same order, so the operator and
+    the materialized matrix are the same transform.
+
+    Returns ``(B, rounds, perms)`` with ``perms`` an int32 ``(rounds, d)``
+    array and a list of per-round sign vectors (float64, +/-1).
+    """
+    B = _largest_pow2_divisor(d)
+    if B < 2:
+        raise ValueError(
+            f"d={d} is odd; the randomized Hadamard construction needs an "
+            f"even dimension. Use rotation='haar'."
+        )
+    rng = np.random.default_rng(seed)
+    rounds = 1 if B == d else max(2, math.ceil(math.log(d) / math.log(B)))
+    perms, signs = [], []
+    for _ in range(rounds):
+        perms.append(rng.permutation(d))
+        signs.append(rng.choice(np.array([-1.0, 1.0], np.float32), size=d))
+    return B, rounds, np.ascontiguousarray(np.stack(perms), dtype=np.int32), signs
+
+
+def _numpy_fwht_rows(Y: np.ndarray, B: int) -> np.ndarray:
+    """Unnormalized block FWHT of each row, pairing exactly as the C kernel."""
+    n, d = Y.shape
+    V = Y.reshape(n, d // B, B)
+    h = 1
+    while h < B:
+        V2 = V.reshape(n, d // B, B // (2 * h), 2, h)
+        a = V2[..., 0, :].copy()
+        b = V2[..., 1, :].copy()
+        V2[..., 0, :] = a + b
+        V2[..., 1, :] = a - b
+        h *= 2
+    return V.reshape(n, d)
+
+
+_FLOAT_DTYPES = (np.dtype(np.float32), np.dtype(np.float64))
+
+
+class RHTOperator:
+    """``rht_rotation(d, seed)`` applied without materializing it.
+
+    ``rotate_rows(X) == X @ R.T`` and ``unrotate_rows(X) == X @ R`` up to
+    float32 rounding, for float32 or float64 input (the result keeps the
+    input's dtype). Uses the compiled kernel from :mod:`remex._native` when
+    it is available and a NumPy implementation with identical bits
+    otherwise.
+    """
+
+    def __init__(self, d: int, seed: int = 42):
+        self.d = int(d)
+        self.seed = seed
+        self._kernel = None  # resolved on first apply: kernel, or False for NumPy
+        B, rounds, perms, signs = rht_plan(self.d, seed)
+        self.B, self.rounds, self.perms = B, rounds, perms
+        inv_sqrt = 1.0 / math.sqrt(B)
+        self._ss = {
+            np.dtype(np.float32): np.ascontiguousarray(
+                np.stack([s * np.float32(inv_sqrt) for s in signs]), dtype=np.float32),
+            np.dtype(np.float64): np.ascontiguousarray(
+                np.stack([s.astype(np.float64) * inv_sqrt for s in signs]), dtype=np.float64),
+        }
+
+        self._perms_ptr = self.perms.ctypes.data
+        self._ptrs_f32 = self._ss[_FLOAT_DTYPES[0]].ctypes.data
+        self._ptrs_f64 = self._ss[_FLOAT_DTYPES[1]].ctypes.data
+
+    @property
+    def nbytes(self) -> int:
+        return self.perms.nbytes + sum(a.nbytes for a in self._ss.values())
+
+    # -- public -----------------------------------------------------------
+    def rotate_rows(self, X: np.ndarray) -> np.ndarray:
+        """``X @ R.T``."""
+        return self._apply(X, 1)
+
+    def unrotate_rows(self, X: np.ndarray) -> np.ndarray:
+        """``X @ R``."""
+        return self._apply(X, 0)
+
+    def rotate_query(self, q: np.ndarray) -> np.ndarray:
+        """``R @ q`` for a single vector."""
+        return self._apply(q, 1)
+
+    def materialize(self, dtype=np.float32) -> np.ndarray:
+        """The (d, d) matrix this operator applies (rows of ``I @ R``)."""
+        return self.unrotate_rows(np.eye(self.d, dtype=dtype))
+
+    # -- internals --------------------------------------------------------
+    def _apply(self, X, mode: int) -> np.ndarray:
+        if not (type(X) is np.ndarray and X.dtype in _FLOAT_DTYPES
+                and X.flags.c_contiguous):
+            X = np.asarray(X)
+            if X.dtype not in _FLOAT_DTYPES:
+                X = X.astype(np.float32)
+            X = np.ascontiguousarray(X)
+        if X.ndim == 1:
+            if X.shape[0] != self.d:
+                raise ValueError(f"Expected d={self.d}, got shape {X.shape}")
+            return self._apply2(X.reshape(1, self.d), mode)[0]
+        if X.ndim != 2 or X.shape[1] != self.d:
+            raise ValueError(f"Expected d={self.d}, got shape {X.shape}")
+        return self._apply2(X, mode)
+
+    def _apply2(self, X: np.ndarray, mode: int) -> np.ndarray:
+        k = self._kernel
+        if k is None:
+            k = self._kernel = _native_kernel() or False
+        if k is False:
+            return self._apply_numpy(X, mode)
+        return self._apply_native(k, X, mode)
+
+    def _apply_numpy(self, X: np.ndarray, mode: int) -> np.ndarray:
+        ss = self._ss[X.dtype]
+        Y = X
+        order = range(self.rounds) if mode == 0 else reversed(range(self.rounds))
+        for r in order:
+            perm, s = self.perms[r], ss[r]
+            if mode == 0:
+                Y = _numpy_fwht_rows(Y[:, perm] * s, self.B)
+            else:
+                Y = _numpy_fwht_rows(np.array(Y, copy=True), self.B)
+                Z = np.empty_like(Y)
+                Z[:, perm] = Y * s
+                Y = Z
+        return Y
+
+    def _apply_native(self, k, X: np.ndarray, mode: int) -> np.ndarray:
+        f32 = X.dtype == _FLOAT_DTYPES[0]
+        fn = k.f32 if f32 else k.f64
+        ptrs = self._ptrs_f32 if f32 else self._ptrs_f64
+        n, d = X.shape
+        out = np.empty_like(X)
+        args = (d, self.B, self.rounds, self._perms_ptr, ptrs, mode)
+        xp, op = X.ctypes.data, out.ctypes.data
+        if n < 2 or n * d < PARALLEL_MIN_FLOATS or get_num_threads() <= 1:
+            buf = np.empty(d, X.dtype)
+            fn(xp, op, 0, n, *args, buf.ctypes.data)
+            return out
+        threads = min(get_num_threads(), n)
+        step = -(-n // threads)
+
+        def work(lo):
+            buf = np.empty(d, X.dtype)
+            fn(xp, op, lo, min(n, lo + step), *args, buf.ctypes.data)
+
+        list(_executor(threads).map(work, range(0, n, step)))
+        return out
+
+
+def _native_kernel():
+    from remex import _native
+    return _native.kernel()

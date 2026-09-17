@@ -15,7 +15,8 @@ remex/
 ├── codebook.py       # Lloyd-Max codebooks + Matryoshka nested tables
 ├── ivf.py            # IVFCoarseIndex — coarse-tier IVF, data-oblivious
 ├── packing.py        # Bit-packing for sub-byte storage (1-8 bit)
-├── rotation.py       # Haar (QR), randomized Hadamard, and the identity
+├── rotation.py       # Haar (QR), randomized Hadamard (dense + RHTOperator), identity
+├── _native.py        # C kernel for RHTOperator, compiled on first use; NumPy fallback
 └── gpu.py            # Optional GPU backend (CuPy/PyTorch/NumPy)
 
 tests/
@@ -42,7 +43,7 @@ bench/
 ```
 float32 embeddings
     → normalize (store norms separately)
-    → rotate (R @ x, random orthogonal matrix)
+    → rotate (R @ x; "rht" applies RHTOperator instead of a matrix)
     → quantize (searchsorted into Lloyd-Max boundaries → uint8 indices)
     → CompressedVectors (indices + norms)
 
@@ -113,7 +114,7 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
 
 ## Code conventions
 
-- **NumPy-only core**: No PyTorch/CuPy dependency in `remex/core.py`. GPU support is opt-in via `remex/gpu.py`.
+- **NumPy-only core**: No PyTorch/CuPy dependency in `remex/core.py`. GPU support is opt-in via `remex/gpu.py`. The one compiled piece, `remex/_native.py`, is optional: without a C compiler (or with `REMEX_NO_NATIVE=1`) `RHTOperator` uses a NumPy path that performs the same operations in the same order and returns the same bits. `tests/test_rht_operator.py` enforces that equality.
 - **No training**: Fully data-oblivious. The quantizer is determined by `(d, bits, seed, rotation, normalize, scale)` alone. Scalar mode keeps this: `scale` is a value the caller *declares*, never one remex measures off the data.
 - **The rotation is part of the encoding**: every persisted container (`.pq` byte 17, `.npz` `rotation` key,
   Arrow `b"rotation"` metadata) records which rotation wrote it, and an absent record means `"haar"` — the
@@ -123,7 +124,7 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
   records that by *omitting* the norms column (`.npz`/Arrow) or setting the no-norms flag (`.pq` byte 18,
   bit 0). Decoding or searching across the two modes raises, like a rotation mismatch.
 - **Honest compression**: `nbytes` property uses bit-packed sizes, not uint8. Benchmark tables report packed compression ratios.
-- **Deterministic**: Same `(d, bits, seed)` must produce identical results across runs. `rotation="none"` strengthens this to bit-identical across BLAS builds, because no matmul enters the encoding.
+- **Deterministic**: Same `(d, bits, seed)` must produce identical results across runs. `rotation="none"` and `rotation="rht"` strengthen this to bit-identical across machines, because no matmul enters the encoding (`"rht"` uses only gathers, multiplies and pairwise add/sub, built with `-ffp-contract=off`). `"haar"` still depends on the BLAS kernel. Codebook boundaries are midpoints of the float32 centroids for the same reason: float64 midpoints inherited ulp differences from `scipy.stats.norm` across NumPy SIMD levels.
 - **Test thresholds**: Recall tests use conservative bounds (e.g. 2-bit R@10 >= 0.3, not exact values) because recall depends on random data.
 
 ## Key design decisions

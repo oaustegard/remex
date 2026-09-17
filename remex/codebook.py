@@ -73,8 +73,18 @@ def lloyd_max_codebook(
         # Cells with negligible mass keep their previous centroid, as before.
         centroids = np.where(prob > 1e-15, updated, centroids)
 
-    boundaries = (centroids[:-1] + centroids[1:]) / 2.0
-    return boundaries.astype(np.float32), centroids.astype(np.float32)
+    # Boundaries are midpoints of the float32 table, not of the float64
+    # centroids. scipy's norm.cdf/pdf differ by an ulp across NumPy's SIMD
+    # dispatch levels (x86-64-v4 vs v3, ARM, Accelerate); the float32 cast
+    # absorbs that for the centroids but not for float64 midpoints, so the
+    # old boundaries differed across machines at 4 and 8 bits (the 4-bit
+    # middle boundary was 0.0 on one, 3.6e-17 on another). A float32 sum
+    # widened to float64 is exact, so these depend only on the float32
+    # centroids. Measured: experiments/rht-operator-native.
+    c32 = centroids.astype(np.float32)
+    c64 = c32.astype(np.float64)
+    boundaries = ((c64[:-1] + c64[1:]) / 2.0).astype(np.float32)
+    return boundaries, c32
 
 
 def nested_codebooks(

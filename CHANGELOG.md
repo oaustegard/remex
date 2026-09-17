@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`rotation="rht"` is applied in operator form**
+  ([#86](https://github.com/oaustegard/remex/issues/86)). `RHTOperator`
+  applies the randomized Hadamard transform row by row (permute, sign, block
+  fast Walsh–Hadamard) instead of multiplying by a d×d matrix. A small C
+  kernel is compiled on first use with the system compiler (`remex/_native.py`,
+  cached under `~/.cache/remex`); without one, or with `REMEX_NO_NATIVE=1`, a
+  NumPy implementation returns the same bits and a warning is logged. Rows are
+  split across a per-process thread pool above `REMEX_PARALLEL_MIN` input
+  floats (default 2^15, the measured crossover on x86, ARM and Apple Silicon);
+  `REMEX_NUM_THREADS` caps it. No OpenMP.
+
+  Time relative to v0.7.0, measured through the public API on GitHub x64,
+  ARM, macOS and Windows runners (`rht`, 4-bit; two runs, v0.7.0 installed
+  alongside and timed twice as a noise control):
+
+  | | d=384 | d=768 | d=1536 | d=3072 |
+  |---|---|---|---|---|
+  | `Quantizer(...)` construction | 0.83–0.94x | 0.61–0.76x | 0.22–0.40x | 0.06–0.11x |
+  | `encode`, 1 vector | 0.93–1.78x | 0.23–1.03x | 0.19–0.55x | 0.09–0.29x |
+  | `encode`, 64 vectors | 0.93–1.15x | 0.81–0.91x | 0.62–0.74x | 0.40–0.51x |
+  | `encode`, 10,000 vectors | 0.84–0.97x | 0.76–0.93x | 0.59–0.87x | 0.41–0.67x |
+
+  At d=384 small calls can be slower: a single-vector encode costs about 4 µs
+  more on Linux ARM and 27 µs more on Windows, where the ctypes call itself is
+  expensive, and batches of 64–256 are up to 15% slower on Windows. Search
+  paths are unchanged within noise: their cost is the scan, not the query
+  rotation. Batch encode is now bounded
+  by `np.searchsorted`, not the rotation. Resident rotation state drops from
+  d² floats (37.7 MB at d=3072) to a few KB.
+
+  `Quantizer.R` is now a property. For `rht` it builds `rht_rotation(d, seed)`
+  on first access, which only `GPUSearcher` and `save_params` do; assigning
+  `R` replaces the operator.
+
+  **Codes change for about 1e-6 of coordinates** (up to 2.3e-5 at 8 bits) of
+  newly encoded `rht` vectors, because the operator and the dense matrix agree
+  to float32 rounding rather than bit for bit. Existing indexes decode
+  unchanged. In exchange, `rht` codes are now identical on every machine
+  measured; before, they differed with the BLAS kernel.
+
+- **Codebook boundaries are midpoints of the float32 centroids.**
+  `lloyd_max_codebook` used midpoints of its float64 centroids, which carry
+  ulp differences from `scipy.stats.norm` across NumPy's SIMD dispatch
+  levels, so 4- and 8-bit boundaries differed between x86 AVX-512, x86 AVX2,
+  ARM and Apple Silicon. Centroids are unchanged, so every existing code
+  decodes as before; boundaries move by an ulp, which reassigns up to ~2e-6 of
+  newly encoded coordinates for Haar and `rht` alike.
+
+- **The Mojo port no longer matches byte for byte.** It still encodes `rht` through the dense matrix
+  and computes its own boundaries, so its codes now match Python's to within
+  the shares above rather than byte for byte.
+
 ## v0.7.0 — 2026-09-11
 
 Five weeks since v0.6.0 (2026-08-04), from six pull requests.

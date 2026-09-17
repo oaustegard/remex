@@ -7,8 +7,8 @@ from remex.codebook import (
 )
 from remex.packing import SUPPORTED_BITS, pack, unpack, packed_nbytes
 from remex.rotation import (
-    LEGACY_ROTATION, haar_rotation, identity_rotation, rht_rotation,
-    validate_rotation,
+    LEGACY_ROTATION, RHTOperator, haar_rotation, identity_rotation,
+    rht_rotation, validate_rotation,
 )
 
 
@@ -629,13 +629,16 @@ class Quantizer:
                 Bit-reproducible against the Mojo port (#40). O(d^3) to build:
                 measured 1.8 s at d=768, 11.4 s at d=1536, 150 s at d=3072.
 
-            "rht" — randomized Hadamard, O(d^2 log d) to build: 0.4 s at
-                d=768, 5.7 s at d=3072 (26x faster). Measured
+            "rht" — randomized Hadamard, applied in operator form
+                (`remex.rotation.RHTOperator`): O(d log d) per row, a few KB
+                of state, and no d x d matrix unless `R` is read. Measured
                 indistinguishable from Haar on retrieval recall
                 (-0.0001 +/- 0.0013 pooled over 3 corpora x 6 bit widths x
-                5 seeds, oaustegard/experiments#11). Bit-reproducible against
-                the Mojo port via `polarquant --rotation rht`. Requires an
-                even d.
+                5 seeds, oaustegard/experiments#11). Its codes are identical
+                on every machine measured (x86, ARM, Apple Silicon), which
+                Haar's dense matmul does not give. The Mojo port applies the
+                dense matrix, so its codes can differ from Python's in about
+                1e-6 of coordinates. Requires an even d.
 
             "none" — no rotation (the identity). Only sensible together with
                 `normalize=False`, where the caller has already conditioned
@@ -733,7 +736,14 @@ class Quantizer:
         self.mean = _validate_mean(mean, d, normalize, self.renorm)
         self.scale = coordinate_sigma(d, sigma)
 
-        self.R = self.ROTATIONS[rotation](d, seed)
+        # "rht" is applied in operator form (remex.rotation.RHTOperator):
+        # faster from d~768 up, a few KB instead of d^2 floats, and
+        # machine-independent output. ``R`` stays available as the same dense
+        # matrix, built on first access, for the GPU path and save_params.
+        self._R = None
+        self._op = RHTOperator(d, seed) if rotation == "rht" else None
+        if self._op is None:
+            self._R = self.ROTATIONS[rotation](d, seed)
         self.boundaries, self.centroids = lloyd_max_codebook(d, bits, sigma=sigma)
 
         # Precompute nested centroid tables for all bit levels <= bits
@@ -839,6 +849,20 @@ class Quantizer:
 
         return CompressedVectors(indices, None, self.d, self.bits, self.rotation)
 
+    @property
+    def R(self) -> np.ndarray:
+        """The (d, d) rotation matrix. For ``rotation="rht"`` it is built on
+        first access (``rht_rotation(d, seed)``); encode and search do not
+        use it."""
+        if self._R is None:
+            self._R = self.ROTATIONS[self.rotation](self.d, self.seed)
+        return self._R
+
+    @R.setter
+    def R(self, value) -> None:
+        self._R = value
+        self._op = None  # an explicitly assigned matrix is what gets applied
+
     def _rotate_rows(self, X: np.ndarray) -> np.ndarray:
         """Apply R to a row-major batch: ``X @ R.T``, identity short-circuited.
 
@@ -849,18 +873,24 @@ class Quantizer:
         """
         if self.rotation == "none":
             return X
+        if self._op is not None:
+            return self._op.rotate_rows(X)
         return X @ self.R.T
 
     def _rotate_query(self, q: np.ndarray) -> np.ndarray:
         """Apply R to a single query vector: ``R @ q``, identity short-circuited."""
         if self.rotation == "none":
             return q
+        if self._op is not None:
+            return self._op.rotate_query(q)
         return self.R @ q
 
     def _unrotate_rows(self, X_rot: np.ndarray) -> np.ndarray:
         """Undo ``_rotate_rows``: ``X_rot @ R`` (R orthogonal, so R.T is R^-1)."""
         if self.rotation == "none":
             return X_rot
+        if self._op is not None:
+            return self._op.unrotate_rows(X_rot)
         return X_rot @ self.R
 
     def _check_rotation(self, compressed) -> None:
