@@ -15,17 +15,22 @@
   floats (default 2^15, the measured crossover on x86, ARM and Apple Silicon);
   `REMEX_NUM_THREADS` caps it. No OpenMP.
 
-  Measured through the public API against v0.7.0 on GitHub x64, ARM and macOS
-  runners, `rht`, 4-bit:
+  Time relative to v0.7.0, measured through the public API on GitHub x64,
+  ARM, macOS and Windows runners (`rht`, 4-bit; two runs, v0.7.0 installed
+  alongside and timed twice as a noise control):
 
-  | | d=768 | d=1536 | d=3072 |
-  |---|---|---|---|
-  | `Quantizer(...)` construction | 0.61–0.71x | 0.22–0.35x | 0.06–0.11x |
-  | `encode`, 1 vector | 0.38–1.03x | 0.19–0.55x | 0.09–0.29x |
-  | `encode`, 10,000 vectors | 0.76–0.93x | 0.59–0.87x | 0.41–0.67x |
+  | | d=384 | d=768 | d=1536 | d=3072 |
+  |---|---|---|---|---|
+  | `Quantizer(...)` construction | 0.83–0.94x | 0.61–0.76x | 0.22–0.40x | 0.06–0.11x |
+  | `encode`, 1 vector | 0.93–1.78x | 0.23–1.03x | 0.19–0.55x | 0.09–0.29x |
+  | `encode`, 64 vectors | 0.93–1.15x | 0.81–0.91x | 0.62–0.74x | 0.40–0.51x |
+  | `encode`, 10,000 vectors | 0.84–0.97x | 0.76–0.93x | 0.59–0.87x | 0.41–0.67x |
 
-  At d=384 the change is within ±15% either way. Search paths are unchanged:
-  their cost is the scan, not the query rotation. Batch encode is now bounded
+  At d=384 small calls can be slower: a single-vector encode costs about 4 µs
+  more on Linux ARM and 27 µs more on Windows, where the ctypes call itself is
+  expensive, and batches of 64–256 are up to 15% slower on Windows. Search
+  paths are unchanged within noise: their cost is the scan, not the query
+  rotation. Batch encode is now bounded
   by `np.searchsorted`, not the rotation. Resident rotation state drops from
   d² floats (37.7 MB at d=3072) to a few KB.
 
