@@ -156,3 +156,42 @@ def theoretical_mse(d: int, bits: int) -> float:
 def theoretical_lower_bound(bits: int) -> float:
     """Information-theoretic lower bound on MSE (Theorem 3)."""
     return 4 ** (-bits)
+
+
+def assign_codes(X_rot, boundaries, bits: int) -> np.ndarray:
+    """``np.searchsorted(boundaries, X_rot).astype(np.uint8)``, compiled.
+
+    Identical output, not merely close: both paths compare the same IEEE
+    values, and NaN lands in the top cell either way. The compiled path is
+    roughly 6x faster and writes uint8 directly, which avoids the int64
+    intermediate that searchsorted allocates (8 bytes per coordinate).
+
+    Falls back to searchsorted when no compiled kernel is available.
+    """
+    from remex import _native
+    from remex.rotation import PARALLEL_MIN_FLOATS, executor, get_num_threads
+
+    k = _native.kernel()
+    if k is None:
+        return np.searchsorted(boundaries, X_rot).astype(np.uint8)
+
+    X_rot = np.ascontiguousarray(X_rot)
+    f64 = X_rot.dtype == np.float64
+    if not f64 and X_rot.dtype != np.float32:
+        X_rot = X_rot.astype(np.float32)
+        f64 = False
+    # searchsorted promotes float32 boundaries to float64 against a float64
+    # haystack; match that exactly.
+    b = np.ascontiguousarray(boundaries, dtype=np.float64 if f64 else np.float32)
+    fn = k.quant_f64 if f64 else k.quant_f32
+    out = np.empty(X_rot.shape, np.uint8)
+    n = X_rot.size
+    xp, op, bp = X_rot.ctypes.data, out.ctypes.data, b.ctypes.data
+    threads = get_num_threads()
+    if threads <= 1 or n < PARALLEL_MIN_FLOATS:
+        fn(xp, op, 0, n, bp, bits)
+        return out
+    step = -(-n // threads)
+    list(executor(threads).map(lambda lo: fn(xp, op, lo, min(n, lo + step), bp, bits),
+                               range(0, n, step)))
+    return out

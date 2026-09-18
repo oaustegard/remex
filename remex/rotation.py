@@ -302,7 +302,7 @@ def get_num_threads() -> int:
     return _default_threads_cache
 
 
-def _executor(workers: int):
+def executor(workers: int):
     """A per-process pool. A forked child gets a fresh one: the parent's
     worker threads do not exist there, and submitting to them would hang."""
     global _pool, _pool_pid
@@ -464,7 +464,7 @@ class RHTOperator:
             buf = np.empty(d, X.dtype)
             fn(xp, op, lo, min(n, lo + step), *args, buf.ctypes.data)
 
-        list(_executor(threads).map(work, range(0, n, step)))
+        list(executor(threads).map(work, range(0, n, step)))
         return out
 
 
