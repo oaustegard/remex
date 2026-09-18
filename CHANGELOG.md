@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## v0.8.0 — 2026-09-17
+
+Six days since v0.7.0 (2026-09-11), from two pull requests, both about the
+`rht` rotation and what stood behind it.
+
+The rotation itself no longer exists as a matrix during encoding. `rht` is
+applied in operator form — permute, sign, block fast Walsh-Hadamard, row by
+row — through a C kernel compiled on first use, with a NumPy path that
+returns the same bits where no compiler is available. That made two other
+things visible. Codes had never been reproducible across machines, because
+`sgemm` picks different kernels on different CPUs and the codebook boundaries
+inherited ulp noise from `scipy.stats.norm` across NumPy's SIMD dispatch
+levels; with the operator and float32-derived boundaries, `rotation="rht"`
+now produces identical codes on x86, ARM, Apple Silicon and Windows. And with
+the rotation cheap, `np.searchsorted` turned out to be most of `encode`, so
+it is compiled too, and `encode` runs in row blocks that bound its float64
+temporaries.
+
+Everything below was measured against v0.7.0 on GitHub x64, ARM, macOS and
+Windows runners, with v0.7.0 installed alongside and timed twice as a noise
+control: [experiments/rht-operator-native](https://github.com/oaustegard/experiments/tree/main/rht-operator-native).
+
+Upgrading changes codes for `rotation="rht"` in about 1e-6 of coordinates
+(2.3e-5 at 8 bits), and for every rotation by up to ~2e-6 from the boundary
+change. Existing indexes decode unchanged; the centroid table did not move.
 
 ### Changed
 
