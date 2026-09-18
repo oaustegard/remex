@@ -16,9 +16,12 @@
   `encode` now processes rows in blocks of about `REMEX_ENCODE_BLOCK` input
   floats (default 2^19), which bounds the float64 norm temporaries. Every
   step is per row or per coordinate, so the codes do not depend on the block
-  size. One exception: with `rotation="haar"` in centred mode the norms
-  column can shift by an ulp, because `_centred_lengths` unrotates through a
-  BLAS matmul whose rounding depends on the block shape.
+  size — with one exception. `rotation="haar"` applies a BLAS matmul, whose
+  rounding depends on the shape it is handed, so blocking moves about 1e-6 of
+  8-bit haar codes (measured 2.6e-6 at d=384, 6.5e-7 at d=768; none at 1–4
+  bits) and, in centred mode, the norms column by an ulp. `rotation="rht"`
+  and `"none"` are unaffected: their output is bit-identical to the previous
+  release, on every platform measured.
 
   `np.searchsorted` had become the largest cost in `encode` once the rotation
   moved to operator form: 45% of it at 1 bit and 82–85% at 8 bits. Local,
