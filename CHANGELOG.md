@@ -4,6 +4,36 @@
 
 ### Changed
 
+- **`encode` assigns codes with a compiled kernel and runs in row blocks.**
+  `remex.codebook.assign_codes` replaces `np.searchsorted` on both encode
+  paths with a branchless binary search in `remex/_native.py`, split across
+  the same thread pool as the rotation. The output is identical by
+  construction rather than by tolerance: both compare the same IEEE values,
+  and NaN lands in the top cell either way, so `np.searchsorted` remains the
+  fallback when no kernel is available. It also writes `uint8` directly,
+  dropping searchsorted's int64 intermediate (8 bytes per coordinate).
+
+  `encode` now processes rows in blocks of about `REMEX_ENCODE_BLOCK` input
+  floats (default 2^19), which bounds the float64 norm temporaries. Every
+  step is per row or per coordinate, so the codes do not depend on the block
+  size. One exception: with `rotation="haar"` in centred mode the norms
+  column can shift by an ulp, because `_centred_lengths` unrotates through a
+  BLAS matmul whose rounding depends on the block shape.
+
+  `np.searchsorted` had become the largest cost in `encode` once the rotation
+  moved to operator form: 45% of it at 1 bit and 82–85% at 8 bits. Local,
+  10,000 vectors, one core:
+
+  | | 1 bit | 2 bit | 4 bit | 8 bit |
+  |---|---|---|---|---|
+  | d=768 encode | 168 → 96 ms | 216 → 110 ms | 309 → 128 ms | 553 → 161 ms |
+  | d=3072 encode | 737 → 373 ms | 882 → 403 ms | 1277 → 473 ms | 2253 → 638 ms |
+
+  Peak allocation during `encode` of 10,000 × 3072 drops from 522 MB to
+  39 MB, against 31 MB of codes produced. Codes and norms are unchanged:
+  verified byte-identical to the previous release across 1/2/3/4/8 bits, all
+  three rotations, scalar mode and NaN input.
+
 - **`rotation="rht"` is applied in operator form**
   ([#86](https://github.com/oaustegard/remex/issues/86)). `RHTOperator`
   applies the randomized Hadamard transform row by row (permute, sign, block

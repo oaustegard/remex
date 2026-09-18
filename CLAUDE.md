@@ -16,7 +16,7 @@ remex/
 ├── ivf.py            # IVFCoarseIndex — coarse-tier IVF, data-oblivious
 ├── packing.py        # Bit-packing for sub-byte storage (1-8 bit)
 ├── rotation.py       # Haar (QR), randomized Hadamard (dense + RHTOperator), identity
-├── _native.py        # C kernel for RHTOperator, compiled on first use; NumPy fallback
+├── _native.py        # C kernels (RHTOperator apply, code assignment), compiled on first use
 └── gpu.py            # Optional GPU backend (CuPy/PyTorch/NumPy)
 
 tests/
