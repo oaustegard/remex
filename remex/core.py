@@ -1,8 +1,11 @@
 """Core remex encoder/decoder with Matryoshka bit precision."""
 
+import os
+
 import numpy as np
 from typing import Optional, Tuple, Iterable
 from remex.codebook import (
+    assign_codes,
     coordinate_sigma, lloyd_max_codebook, nested_codebooks,
 )
 from remex.packing import SUPPORTED_BITS, pack, unpack, packed_nbytes
@@ -599,6 +602,11 @@ class PackedVectors:
         return cls(packed, norms, n, d, bits, rotation)
 
 
+#: Row blocks in ``encode`` are sized to about this many input floats. Only
+#: peak memory depends on it; the codes do not.
+ENCODE_BLOCK_FLOATS = int(os.environ.get("REMEX_ENCODE_BLOCK", 1 << 19))
+
+
 class Quantizer:
     """
     Vector quantizer with Matryoshka bit precision.
@@ -769,33 +777,47 @@ class Quantizer:
         if X.shape[1] != self.d:
             raise ValueError(f"Expected d={self.d}, got {X.shape[1]}")
 
-        # Compute norms in float64, cast to float32. Removes the 1-ULP
-        # reduction-order divergence between BLAS (np.linalg.norm) and
-        # Mojo's SIMD reduce_add — needed for byte-identical .pq parity
-        # with the Mojo encoder.
-        norms64 = np.sqrt(np.sum(X.astype(np.float64) ** 2, axis=1))
-        norms = norms64.astype(np.float32)
+        # Encode in row blocks. Every step below is per row or per
+        # coordinate, so the codes do not depend on the block size; what it
+        # bounds is the float64 norm temporaries, which otherwise peak at 16
+        # bytes per coordinate of the whole input.
+        n = X.shape[0]
+        rows = max(1, ENCODE_BLOCK_FLOATS // self.d)
+        indices = np.empty((n, self.d), np.uint8)
+        norms = np.empty(n, np.float32)
+        lengths_out = None if self.mean is None else np.empty(n, np.float32)
+        for lo in range(0, n, rows):
+            hi = min(n, lo + rows)
+            blk = X[lo:hi]
+            # Compute norms in float64, cast to float32. Removes the 1-ULP
+            # reduction-order divergence between BLAS (np.linalg.norm) and
+            # Mojo's SIMD reduce_add — needed for byte-identical .pq parity
+            # with the Mojo encoder.
+            norms64 = np.sqrt(np.sum(blk.astype(np.float64) ** 2, axis=1))
+            norms[lo:hi] = norms64.astype(np.float32)
 
-        target = X if self.mean is None else X - self.mean
-        if self.mean is None:
-            lengths = norms
-        else:
-            lengths = np.sqrt(
-                np.sum(target.astype(np.float64) ** 2, axis=1)
-            ).astype(np.float32)
+            target = blk if self.mean is None else blk - self.mean
+            if self.mean is None:
+                lengths = norms[lo:hi]
+            else:
+                lengths = np.sqrt(
+                    np.sum(target.astype(np.float64) ** 2, axis=1)
+                ).astype(np.float32)
 
-        X_unit = target / np.maximum(lengths, 1e-8)[:, None]
-        X_rot = self._rotate_rows(X_unit)
-
-        indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
+            X_unit = target / np.maximum(lengths, 1e-8)[:, None]
+            X_rot = self._rotate_rows(X_unit)
+            indices[lo:hi] = assign_codes(X_rot, self.boundaries, self.bits)
+            if self.mean is not None:
+                lengths_out[lo:hi] = self._centred_lengths(
+                    indices[lo:hi], norms64, lengths
+                )
 
         if self.mean is None:
             return CompressedVectors(
                 indices, norms, self.d, self.bits, self.rotation
             )
         return CompressedVectors(
-            indices, self._centred_lengths(indices, norms64, lengths),
-            self.d, self.bits, self.rotation, self.mean,
+            indices, lengths_out, self.d, self.bits, self.rotation, self.mean,
         )
 
     def _centred_lengths(self, indices, norms64, fallback):
@@ -839,13 +861,17 @@ class Quantizer:
         if X.shape[1] != self.d:
             raise ValueError(f"Expected d={self.d}, got {X.shape[1]}")
 
-        X_rot = self._rotate_rows(X)
-        # searchsorted promotes the float32 boundaries to float64, so an
-        # out-of-range magnitude saturates at the outermost cell instead of
-        # overflowing to inf. NaN sorts above every boundary; it lands in
-        # the top cell rather than raising, which keeps a code well-defined
-        # for every input.
-        indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
+        # assign_codes reproduces searchsorted exactly: the float32
+        # boundaries are compared against this float64 haystack in float64,
+        # so an out-of-range magnitude saturates at the outermost cell
+        # instead of overflowing to inf, and NaN sorts above every boundary
+        # into the top cell rather than raising. Every input has a code.
+        rows = max(1, ENCODE_BLOCK_FLOATS // self.d)
+        indices = np.empty((X.shape[0], self.d), np.uint8)
+        for lo in range(0, X.shape[0], rows):
+            hi = min(X.shape[0], lo + rows)
+            X_rot = self._rotate_rows(X[lo:hi])
+            indices[lo:hi] = assign_codes(X_rot, self.boundaries, self.bits)
 
         return CompressedVectors(indices, None, self.d, self.bits, self.rotation)
 

@@ -1,4 +1,8 @@
-"""remex._native — compiled randomized-Hadamard apply.
+"""remex._native — compiled kernels for the encode path.
+
+Two of them: the randomized-Hadamard apply behind
+:class:`remex.rotation.RHTOperator`, and the code assignment that replaces
+``np.searchsorted`` in :func:`remex.codebook.assign_codes`.
 
 A small C library, compiled on first use with the system C compiler
 (``cc``/``gcc``/``clang``), cached in a user-private directory and loaded
@@ -99,6 +103,31 @@ void rht_apply_##NAME(const T *X, T *out, int64_t lo, int64_t hi,            \
 
 DEFINE_RHT(float, f32)
 DEFINE_RHT(double, f64)
+
+/*
+ * Code assignment: out[k] = #{b_i < x[k]}, which is exactly
+ * np.searchsorted(b, x, side="left"), with NaN sent to the top cell as NumPy
+ * does (NaN sorts above every boundary). Branchless binary search over the
+ * 2^bits - 1 boundaries. Comparisons are exact in IEEE 754, so the NumPy and
+ * compiled paths agree by construction, not by tolerance.
+ */
+#define DEFINE_QUANT(T, NAME)                                                \
+void quant_##NAME(const T *x, uint8_t *out, int64_t lo, int64_t hi,          \
+                  const T *b, int32_t bits) {                                \
+    const int32_t m = (1 << bits) - 1;                                       \
+    for (int64_t k = lo; k < hi; k++) {                                      \
+        const T v = x[k];                                                    \
+        int32_t idx = 0;                                                     \
+        for (int32_t step = 1 << (bits - 1); step > 0; step >>= 1) {         \
+            const int32_t c = idx + step;                                    \
+            idx = (c <= m && v > b[c - 1]) ? c : idx;                        \
+        }                                                                    \
+        out[k] = (uint8_t)((v != v) ? m : idx);                              \
+    }                                                                        \
+}
+
+DEFINE_QUANT(float, q32)
+DEFINE_QUANT(double, q64)
 """
 
 _FLAGS = ["-O3", "-ffp-contract=off", "-fPIC", "-shared"]
@@ -179,6 +208,11 @@ class _Kernel:
         for fn in (self.f32, self.f64):
             fn.restype = None
             fn.argtypes = argtypes
+        self.quant_f32 = self.lib.quant_q32
+        self.quant_f64 = self.lib.quant_q64
+        for fn in (self.quant_f32, self.quant_f64):
+            fn.restype = None
+            fn.argtypes = [vp, vp, i64, i64, vp, i32]
         self.path = path
 
 
