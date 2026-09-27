@@ -8,5 +8,5 @@
   "test": ["python3", "-m", "pytest", "-q", "-k"],
   "testMatch": "[1-9]\\d* passed",
   "oracleExecution": "serial",
-  "ignore": ["node_modules", ".git", ".venv", "__pycache__", ".pytest_cache", "bench", "docs", "mojo"]
+  "ignore": ["node_modules", ".git", ".venv", "__pycache__", ".pytest_cache", "bench", "docs"]
 }

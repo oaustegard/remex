@@ -1,7 +1,6 @@
 """Core remex encoder/decoder with Matryoshka bit precision."""
 
 import os
-import warnings
 
 import numpy as np
 from typing import Optional, Tuple, Iterable
@@ -11,8 +10,8 @@ from remex.codebook import (
 )
 from remex.packing import SUPPORTED_BITS, pack, unpack, packed_nbytes
 from remex.rotation import (
-    LEGACY_ROTATION, RHT_MIN_ROUNDS, RHTOperator, haar_rotation,
-    identity_rotation, rht_rotation, rht2_rotation, validate_rotation,
+    LEGACY_ROTATION, RHTOperator, haar_rotation, identity_rotation,
+    rht_rotation, validate_rotation,
 )
 
 
@@ -632,11 +631,10 @@ class Quantizer:
         d: Vector dimension.
         bits: Bits per coordinate (1-8). 3-4 is the sweet spot.
         seed: Random seed for rotation matrix.
-        rotation: Which orthogonal rotation to use.
-
-            "haar" (default) — Haar-distributed, via explicit Householder QR.
-                Bit-reproducible against the Mojo port (#40). O(d^3) to build:
-                measured 1.8 s at d=768, 11.4 s at d=1536, 150 s at d=3072.
+        rotation: Which orthogonal rotation to use. Default None picks
+            "rht" when d is even and "haar" when d is odd, which "rht" cannot
+            handle. The quantizer's `rotation` attribute holds the name that
+            was picked.
 
             "rht" — randomized Hadamard, applied in operator form
                 (`remex.rotation.RHTOperator`): O(d log d) per row, a few KB
@@ -649,18 +647,18 @@ class Quantizer:
                 dense matrix, so its codes can differ from Python's in about
                 1e-6 of coordinates. Requires an even d.
 
-                At a power-of-two d (64, 128, 256, 1024, ...) "rht" ignores
-                the seed: every seed decodes bit-identically, because its
-                single round reduces to a fixed Walsh-Hadamard transform
-                followed by a signed permutation, which the codebook cannot
-                see (issue #89). It is kept unchanged so existing files
-                decode, and warns at those d. Use "rht2" for new encodings.
+                Since 1.0 it takes at least two rounds at every d. Before,
+                a power-of-two d (64, 128, 256, 1024, ...) took one, which
+                reduces to a fixed Walsh-Hadamard transform followed by a
+                signed permutation the codebook cannot see: every seed
+                decoded bit-identically (issue #89). Codes at those d
+                changed in 1.0; at other d they did not.
 
-            "rht2" — "rht" with at least two rounds at every d, so the seed
-                randomizes the transform at power-of-two d too. At any other
-                even d it is the same transform as "rht" and gives the same
-                codes; the name still differs on disk, and decoding one
-                under the other raises. The Mojo port does not implement it.
+            "haar" — Haar-distributed, via explicit Householder QR.
+                Bit-reproducible against the Mojo port (#40). O(d^3) to build:
+                measured 1.8 s at d=768, 11.4 s at d=1536, 150 s at d=3072.
+                The default before 1.0, and what a file with no rotation
+                record decodes as.
 
             "none" — no rotation (the identity). Only sensible together with
                 `normalize=False`, where the caller has already conditioned
@@ -669,7 +667,7 @@ class Quantizer:
                 is what a hash key wants. See
                 `remex.rotation.identity_rotation`.
 
-            All four are seed-deterministic and exactly orthogonal. The
+            All three are seed-deterministic and exactly orthogonal. The
             rotation is part of the encoding: vectors encoded under one
             CANNOT be decoded under another, so it must match across
             encode/decode exactly as `seed` must.
@@ -716,11 +714,10 @@ class Quantizer:
         "haar": haar_rotation,
         "rht": rht_rotation,
         "none": identity_rotation,
-        "rht2": rht2_rotation,
     }
 
     def __init__(self, d: int, bits: int = 4, seed: int = 42,
-                 rotation: str = "haar", normalize: bool = True,
+                 rotation: Optional[str] = None, normalize: bool = True,
                  scale: Optional[float] = None, renorm: bool = True,
                  mean: Optional[np.ndarray] = None):
         if bits < 1 or bits > 8:
@@ -732,6 +729,8 @@ class Quantizer:
                 f"benefit over 4-bit or 8-bit."
             )
 
+        if rotation is None:
+            rotation = "rht" if d % 2 == 0 else "haar"
         if rotation not in self.ROTATIONS:
             raise ValueError(
                 f"rotation must be one of {sorted(self.ROTATIONS)}, "
@@ -759,22 +758,12 @@ class Quantizer:
         self.mean = _validate_mean(mean, d, normalize, self.renorm)
         self.scale = coordinate_sigma(d, sigma)
 
-        # "rht" and "rht2" are applied in operator form (remex.rotation.RHTOperator):
+        # "rht" is applied in operator form (remex.rotation.RHTOperator):
         # faster from d~768 up, a few KB instead of d^2 floats, and
         # machine-independent output. ``R`` stays available as the same dense
         # matrix, built on first access, for the GPU path and save_params.
         self._R = None
-        self._op = None
-        if rotation in RHT_MIN_ROUNDS:
-            self._op = RHTOperator(d, seed, min_rounds=RHT_MIN_ROUNDS[rotation])
-            if self._op.rounds == 1:
-                warnings.warn(
-                    f"rotation='rht' at d={d} (a power of two) ignores the "
-                    f"seed: every seed decodes identically (remex issue #89). "
-                    f"Kept so existing files decode; use rotation='rht2' "
-                    f"for new encodings.",
-                    UserWarning, stacklevel=2,
-                )
+        self._op = RHTOperator(d, seed) if rotation == "rht" else None
         if self._op is None:
             self._R = self.ROTATIONS[rotation](d, seed)
         self.boundaries, self.centroids = lloyd_max_codebook(d, bits, sigma=sigma)
@@ -902,9 +891,9 @@ class Quantizer:
 
     @property
     def R(self) -> np.ndarray:
-        """The (d, d) rotation matrix. For ``rotation="rht"`` and ``"rht2"``
-        it is built on first access (``rht_rotation(d, seed, min_rounds)``);
-        encode and search do not use it."""
+        """The (d, d) rotation matrix. For ``rotation="rht"`` it is built on
+        first access (``rht_rotation(d, seed)``); encode and search do not
+        use it."""
         if self._R is None:
             self._R = self.ROTATIONS[self.rotation](self.d, self.seed)
         return self._R

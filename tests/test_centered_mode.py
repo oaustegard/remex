@@ -159,8 +159,13 @@ class TestRecall:
         queries, corpus = X[:60], X[60:]
         truth = topk(corpus, queries, 10)
 
+        # The margins were calibrated on this draw under haar, the default
+        # before 1.0. They sit near the noise floor at 4 bits for either
+        # rotation: over data seeds 3-8 the 4-bit gain ranged 0.017-0.065
+        # under haar and 0.012-0.040 under rht (mean 0.039 vs 0.026).
         def r10(mean):
-            pq = Quantizer(d=corpus.shape[1], bits=bits, seed=42, mean=mean)
+            pq = Quantizer(d=corpus.shape[1], bits=bits, seed=42, mean=mean,
+                           rotation="haar")
             return recall(topk(pq.decode(pq.encode(corpus)), queries, 10), truth, 10)
 
         assert r10(remex.corpus_mean(corpus)) >= r10(None) + margin

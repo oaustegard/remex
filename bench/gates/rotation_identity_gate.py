@@ -176,7 +176,10 @@ def main() -> int:
 
         def _prefix_load(path):
             cv = _real_load(path)
-            live_default = _library_default_rotation()
+            # Resolved the way Quantizer resolves it: since 1.0 the raw
+            # default is None, meaning "rht" for even d and "haar" for odd.
+            live_default = _library_default_rotation() or (
+                "rht" if cv.d % 2 == 0 else "haar")
             return CompressedVectors(
                 cv.indices, cv.norms, cv.d, cv.bits, live_default
             )

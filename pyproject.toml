@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remex"
-version = "0.8.0"
+version = "1.0.0"
 description = "Retrieval-validated embedding compression. 4-8x smaller vectors, proven recall."
 readme = "README.md"
 license = {text = "MIT"}
@@ -18,14 +18,7 @@ arrow = ["pyarrow>=12.0"]
 bench = ["faiss-cpu", "sentence-transformers"]
 
 [tool.setuptools.packages.find]
-# The Mojo port is checkout-only and is deliberately not distributed: `.mojo`
-# sources are not installable by pip, and Mojo is not a declarable dependency.
-# Without this exclude, `remex/mojo/` contributes no .mojo files to the wheel
-# (setuptools ships only .py without package-data) but DOES ship its bench
-# driver and two test-fixture builders — a package path whose actual content
-# is absent. Run the Mojo paths from a checkout.
 include = ["remex*"]
-exclude = ["remex.mojo*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

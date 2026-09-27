@@ -43,7 +43,7 @@ bench/
 ```
 float32 embeddings
     → normalize (store norms separately)
-    → rotate (R @ x; "rht"/"rht2" apply RHTOperator instead of a matrix)
+    → rotate (R @ x; "rht", the default for even d, applies RHTOperator instead of a matrix)
     → quantize (searchsorted into Lloyd-Max boundaries → uint8 indices)
     → CompressedVectors (indices + norms)
 
@@ -118,8 +118,11 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
 - **No training**: Fully data-oblivious. The quantizer is determined by `(d, bits, seed, rotation, normalize, scale)` alone. Scalar mode keeps this: `scale` is a value the caller *declares*, never one remex measures off the data.
 - **The rotation is part of the encoding**: every persisted container (`.pq` byte 17, `.npz` `rotation` key,
   Arrow `b"rotation"` metadata) records which rotation wrote it, and an absent record means `"haar"` — the
-  frozen historical value, never the live default. That rule is what makes the default safe to change; see
-  `bench/gates/rotation_identity_gate.py`.
+  frozen historical value, never the live default. That rule is what let the default change to `"rht"` in 1.0;
+  see `bench/gates/rotation_identity_gate.py`.
+- **`"rht"` takes at least two rounds at every d** (`rotation.rht_rounds`). One round is seed-blind: a signed
+  permutation after a fixed WHT, which the per-coordinate symmetric codebook cannot see (#89).
+  `tests/test_rht_seed.py` compares decodes across seeds, not matrices, because `R` differs by seed either way.
 - **So is the mode**: a scalar-mode container (`normalize=False`) has `norms is None`, and every serializer
   records that by *omitting* the norms column (`.npz`/Arrow) or setting the no-norms flag (`.pq` byte 18,
   bit 0). Decoding or searching across the two modes raises, like a rotation mismatch.
@@ -141,7 +144,7 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
    Three things to keep in mind when touching scoring code:
    - **Every path that multiplies by norms must go through `_effective_norms`.** `core.py` (decode, search, search_adc, search_twostage, search_batch), `ivf.py` and `gpu.py` all do. `tests/test_ivf.py` and `tests/test_adc_gpu.py` assert those paths agree with `Quantizer.search`, so missing one fails loudly rather than silently returning a different ranking.
    - **It is per precision.** A Matryoshka level has its own centroid table and therefore its own direction lengths; the cache on the container is keyed by precision for that reason.
-   - **The Mojo port does not implement it yet.** `mojo/src/quantizer.mojo` still multiplies raw `norms`, so `polarquant` search diverges from Python search. `.pq` encode parity is unaffected — the codes are identical.
+   - **The Mojo port does not implement it yet.** `src/quantizer.mojo` in oaustegard/remex-mojo still multiplies raw `norms`, so `polarquant` search diverges from Python search. `.pq` encode parity is unaffected — the codes are identical.
 
 4. **Centered mode (`mean=`, opt-in)** — encodes `x - mu` and solves at encode time for the stored length `m` such that `||mu + m*u_hat|| == ||x||`. That keeps the whole correction in the norms column, so a centered index costs no per-vector bytes; `_centred_lengths` does the quadratic. The two halves are inseparable: centering with the residual's own length loses 0.03-0.18 R@10, which `bench/centered_eval.py`'s naive column shows.
 

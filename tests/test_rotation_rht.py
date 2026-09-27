@@ -46,12 +46,12 @@ def test_incoherence_matches_haar(d):
     U /= np.linalg.norm(U, axis=1, keepdims=True)
     ideal = float(np.mean(np.max(np.abs(U), axis=1)))
 
-    # The lower edge is ATTAINABLE and inclusive, with an ulp of slack. When
-    # the Hadamard block spans the whole vector (d a power of two, one round)
-    # a spike maps to exactly +-1/sqrt(d) in every coordinate -- the
-    # information-theoretic floor, since the coordinates square to 1. Reaching
-    # it is optimal, not a failure, and float32 rounding lands a hair below the
-    # float64 constant. A strict comparison here fails on a perfect rotation.
+    # The lower edge is ATTAINABLE and inclusive, with an ulp of slack: a
+    # spike spread to exactly +-1/sqrt(d) in every coordinate is the
+    # information-theoretic floor, since the coordinates square to 1. Before
+    # 1.0 a power-of-two d took one round and landed exactly there, for every
+    # seed (#89). Reaching it is optimal, not a failure, and float32 rounding
+    # lands a hair below the float64 constant.
     floor = (1.0 - 1e-6) / math.sqrt(d)
     for name, R in (("haar", haar_rotation(d, 5)), ("rht", rht_rotation(d, 5))):
         mu = float(np.mean(np.max(np.abs(E @ R.T), axis=1)))

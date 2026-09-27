@@ -28,12 +28,12 @@ Three steps, each with a clear purpose:
 
 1. **Random rotation** — A fixed orthogonal matrix transforms any embedding distribution so that coordinates become approximately i.i.d. N(0, 1/d). This is the key insight from TurboQuant: it makes quantization **data-oblivious**, meaning no training data is required.
 
-   Two constructions are available, selected by `rotation=`:
+   Two constructions are available, selected by `rotation=`. The default is `"rht"` when `d` is even and `"haar"` when it is odd:
 
    | | construction | d=768 | d=1536 | d=3072 |
    |---|---|--:|--:|--:|
-   | `"haar"` *(default)* | Householder QR, O(d³) | 1.27 s | 10.44 s | 116.29 s |
-   | `"rht"` | randomized Hadamard, O(d² log d) | 0.034 s | 0.242 s | 1.00 s |
+   | `"haar"` | Householder QR, O(d³) | 1.27 s | 10.44 s | 116.29 s |
+   | `"rht"` *(default)* | randomized Hadamard, O(d² log d) | 0.034 s | 0.242 s | 1.00 s |
    | | | **38×** | **43×** | **116×** |
 
    *Building the rotation matrix only, min of 2, single-core Xeon @ 2.10 GHz.
@@ -44,11 +44,11 @@ Three steps, each with a clear purpose:
    incoherence-processing rotation, and what the coordinates-become-Gaussian
    argument actually needs.
 
-   It measures indistinguishable from Haar on retrieval recall (−0.0001 ± 0.0013, pooled over 3 corpora × 6 bit widths × 5 seeds). So it is a build-time option, not a quality improvement — which is why the default has not moved. It needs an even `d`; odd dimensions raise and must use `"haar"`.
+   It measures indistinguishable from Haar on retrieval recall (−0.0001 ± 0.0013, pooled over 3 corpora × 6 bit widths × 5 seeds), builds 38–116× faster, and gives the same codes on every machine measured, which Haar's dense matmul does not. That is why it became the default in 1.0. It needs an even `d`; with an odd `d` the default falls back to `"haar"`, and an explicit `"rht"` raises.
 
-   Use `"rht2"` for new encodings. At a power-of-two `d` (64, 128, 256, 1024, …) `"rht"` takes a single round, which reduces to a fixed Walsh–Hadamard transform followed by a seed-dependent signed permutation; the codebook cannot see a signed permutation, so every seed decodes bit-identically ([#89](https://github.com/oaustegard/remex/issues/89)). `"rht2"` takes at least two rounds at every `d`, so the seed counts. Away from powers of two (384, 768, 1536, 3072) the two are the same transform and give the same codes. `"rht"` is kept unchanged so existing files decode, and warns at a power-of-two `d`. The 5-seed recall figure above was measured with `"rht"`, so at power-of-two `d` its seeds repeat one rotation. The Mojo port does not implement `"rht2"`.
+   Since 1.0, `"rht"` takes at least two rounds at every `d`. Before, a power-of-two `d` (64, 128, 256, 1024, …) took one, which reduces to a fixed Walsh–Hadamard transform followed by a seed-dependent signed permutation; the codebook cannot see a signed permutation, so every seed decoded bit-identically ([#89](https://github.com/oaustegard/remex/issues/89)). The recall figure above predates the fix, so at power-of-two `d` its five seeds repeated one rotation. `"rht"` files written before 1.0 at a power-of-two `d` must be re-encoded; at any other `d` the codes did not change.
 
-   Since the next release, `"rht"` is applied in operator form: permute, flip signs, and run a block fast Walsh–Hadamard transform per row, without building the d×d matrix. A small C kernel is compiled on first use; with no C compiler, or `REMEX_NO_NATIVE=1`, a NumPy implementation gives the same bits more slowly (a warning is logged). The operator's codes are identical across x86, ARM and Apple Silicon. Against the dense matrix, `Quantizer` construction at d=3072 takes 6–11% of the time, and batch encode 41–67%; at d=384, single-vector calls can be a few microseconds slower (27 µs on Windows). Measured through the public API on GitHub x64, ARM, macOS and Windows runners ([details](https://github.com/oaustegard/experiments/tree/main/rht-operator-native/integration)). Rows are split across threads above `REMEX_PARALLEL_MIN` input floats (default 2^15); `REMEX_NUM_THREADS` caps the thread count. The Mojo port rebuilds the same matrix byte-for-byte off the same PCG64 stream and encodes through it, so its codes match Python's in all but about 1e-6 of coordinates.
+   `"rht"` is applied in operator form: permute, flip signs, and run a block fast Walsh–Hadamard transform per row, without building the d×d matrix. A small C kernel is compiled on first use; with no C compiler, or `REMEX_NO_NATIVE=1`, a NumPy implementation gives the same bits more slowly (a warning is logged). The operator's codes are identical across x86, ARM and Apple Silicon. Against the dense matrix, `Quantizer` construction at d=3072 takes 6–11% of the time, and batch encode 41–67%; at d=384, single-vector calls can be a few microseconds slower (27 µs on Windows). Measured through the public API on GitHub x64, ARM, macOS and Windows runners ([details](https://github.com/oaustegard/experiments/tree/main/rht-operator-native/integration)). Rows are split across threads above `REMEX_PARALLEL_MIN` input floats (default 2^15); `REMEX_NUM_THREADS` caps the thread count. The [Mojo port](https://github.com/oaustegard/remex-mojo) rebuilds the same matrix byte-for-byte off the same PCG64 stream and encodes through it, so its codes match Python's in all but about 1e-6 of coordinates.
 
    Encoding assigns codes with a compiled branchless binary search instead of `np.searchsorted` (identical output, `np.searchsorted` as the fallback) and runs in row blocks of about `REMEX_ENCODE_BLOCK` input floats. At d=3072, encoding 10,000 vectors takes 473 ms instead of 1277 ms at 4 bits, and peak memory 39 MB instead of 522 MB.
 
@@ -203,7 +203,7 @@ Main quantizer class (formerly `PolarQuantizer`, which remains available as a de
 - **`d`** — Vector dimension (must match your embeddings).
 - **`bits`** — Bits per coordinate: 1-4 or 8. Sweet spot is 3-4. Use 8 for near-lossless.
 - **`seed`** — Random seed for the rotation matrix. Same seed = same quantizer.
-- **`rotation`** — `"haar"` (default), `"rht2"`, `"rht"` (kept for existing files; seed-blind at power-of-two `d`), or `"none"` (the identity — see [scalar mode](#scalar-mode-codes-as-hash-keys)). Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
+- **`rotation`** — `"rht"` (default for even `d`), `"haar"` (default for odd `d`), or `"none"` (the identity — see [scalar mode](#scalar-mode-codes-as-hash-keys)). Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
 - **`normalize`** — `True` (default) factors each vector into unit direction plus a stored norm, as described above. `False` selects [scalar mode](#scalar-mode-codes-as-hash-keys): quantize the coordinates directly, store no norms. Also part of the encoding — a mismatch raises.
 - **`scale`** — Scalar mode only (default `1.0`): the coordinate standard deviation the Lloyd-Max cells are cut for. The normalizing path derives it from the unit sphere as `1/sqrt(d)` and rejects an explicit value.
 - **`mean`** — `None` (default) encodes whole vectors. A `(d,)` array turns on centered mode: codes become offsets from that mean, and the reconstruction is scaled to the original vector's length. Part of the encoding like `rotation` — every container records it and decoding against a different one raises. Requires `renorm=True`, and is rejected in scalar mode. Use `remex.corpus_mean(X)` to compute one; remex will not measure it for you.
@@ -253,7 +253,8 @@ Memory-efficient packed storage. Keeps indices bit-packed in memory, unpacking o
 from remex import PackedVectors
 
 packed = PackedVectors.from_compressed(compressed)  # pack in memory
-packed = PackedVectors.from_rows(rows, norms, d=384, bits=4)  # from DB rows
+# from DB rows; rows carry no rotation record, so name the one that wrote them
+packed = PackedVectors.from_rows(rows, norms, d=384, bits=4, rotation=pq.rotation)
 
 # ADC and two-stage search work directly on PackedVectors
 indices, scores = pq.search_adc(packed, query, k=10)
@@ -461,29 +462,13 @@ pytest tests/test_packed_vectors.py -v  # PackedVectors tests
 
 ## Mojo port (`polarquant`)
 
-**Checkout-only — the Mojo sources are deliberately excluded from the PyPI
-distribution** (`.mojo` files are not pip-installable and Mojo is not a
-declarable dependency), so `pip install remex` will not contain them. Clone the
-repository to build it.
-
-A standalone Mojo CLI binary lives in [`remex/mojo/`](remex/mojo/). It
-mirrors the encode + ADC search path with no Python runtime
-dependency, reading `.npy` corpus files directly and writing a small
-binary `.pq` container that the Python library can load via
-`remex.load_pq()` (and vice versa via `remex.save_pq()`).
-
-```bash
-cd remex/mojo
-mojo build -I . polarquant.mojo -o polarquant
-./polarquant encode corpus.npy --bits 4 --seed 42 -o corpus.pq
-./polarquant search corpus.pq query.npy --k 10 --seed 42
-```
-
-For bit-identical encoding to Python (matching rotations and
-codebook), use `--params P.bin` after dumping with
-`remex.save_params(quantizer, P)`. See
-[`remex/mojo/README.md`](remex/mojo/README.md) for build, test, and
-benchmark instructions.
+A standalone Mojo CLI that mirrors the encode, ADC search and decode paths
+lives in its own repository, [oaustegard/remex-mojo](https://github.com/oaustegard/remex-mojo).
+It reads `.npy` corpus files and writes the same `.pq` container that
+`remex.load_pq()` reads (and `remex.save_pq()` writes). For bit-identical
+encoding against this library, dump a quantizer with `remex.save_params()`
+and pass it to `polarquant --params`. The port's `--seed` path defaults to
+`--rotation haar`, so pass `--rotation rht` to match this library's default.
 
 ## References
 

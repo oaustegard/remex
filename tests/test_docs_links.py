@@ -28,7 +28,6 @@ DOC_FILES = sorted(
         *ROOT.glob("*.md"),
         *ROOT.glob("docs/**/*.md"),
         *ROOT.glob("bench/**/*.md"),
-        *ROOT.glob("remex/mojo/*.md"),
     ]
     if p.is_file()
 )

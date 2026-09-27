@@ -1,6 +1,33 @@
 # Changelog
 
-## Unreleased
+## v1.0.0 — 2026-09-27
+
+A breaking release. The randomized Hadamard rotation becomes the default,
+after a fix that changes its codes at power-of-two dimensions, and the Mojo
+port moves to its own repository.
+
+### Breaking
+
+- **`rotation="rht"` is the default** for even `d`; odd `d` falls back to
+  `"haar"`, which `"rht"` cannot handle. It builds 38-116x faster than Haar
+  at d = 768-3072, gives the same codes on every machine measured, and
+  measures the same on retrieval recall. Every container records its
+  rotation, so existing indexes keep decoding under whatever wrote them, and
+  a file with no record still means `"haar"`. What changes is code that
+  builds a `Quantizer` without `rotation=` to decode an index written by the
+  old default: it now raises a rotation mismatch. Pass `rotation="haar"`.
+  Containers rebuilt from raw rows (`PackedVectors.from_rows`, the
+  `CompressedVectors` constructor) still default to `"haar"`, because rows
+  carry no record; pass `rotation=pq.rotation` for rows a 1.0 default
+  quantizer wrote.
+- **`"rht"` codes changed at every power-of-two d** (64, 128, 256, 512,
+  1024, ...) — the fix below. An `"rht"` index written before 1.0 at those
+  `d` still says `"rht"`, so it is accepted and decodes under the wrong
+  basis without an error. Re-encode it. At every other `d` (384, 768, 1536,
+  3072, ...) the codes are unchanged; `tests/test_rht_seed.py` pins them.
+- **The Mojo port moved** from `remex/mojo/` to
+  [oaustegard/remex-mojo](https://github.com/oaustegard/remex-mojo), with
+  its history. It was never in the wheel, so installs are unaffected.
 
 ### Fixed
 
@@ -9,24 +36,13 @@
   block spanning the whole vector it took one round, whose rotate path is a
   fixed Walsh-Hadamard transform followed by a seed-dependent signed
   permutation. The Lloyd-Max codebook is the same for every coordinate and
-  symmetric about zero, so the permutation dropped out of decode: at d = 64,
-  128, 256, 1024 every seed decoded bit-identically, and a Walsh-aligned
-  input stayed one-hot. `Quantizer.R` did differ by seed, which hid it from
-  checks that compare matrices. Other even d took two or more rounds and
-  were not affected.
-
-### Added
-
-- **`rotation="rht2"`**, on-disk code 3: the randomized Hadamard rotation
-  with at least two rounds at every d. At a d that is not a power of two it
-  is the same transform as `"rht"` and gives the same codes. The Mojo port
-  does not implement it, so `save_params` refuses it.
-
-### Changed
-
-- **`rotation="rht"` warns at a power-of-two d** and otherwise behaves
-  exactly as before: its codes did not move, so files it wrote keep decoding.
-  Re-encode with `"rht2"` to get a seed-dependent rotation at those d.
+  symmetric about zero, so the permutation dropped out of decode: every seed
+  decoded bit-identically, and a Walsh-aligned input stayed one-hot.
+  `Quantizer.R` did differ by seed, which hid it from checks that compare
+  matrices. `rht_rounds` now floors the round count at two for every `d`,
+  which costs one more FWHT pass per row at those `d`. The
+  "indistinguishable from Haar across 5 seeds" recall figure predates the
+  fix, so at power-of-two `d` its seeds repeated one rotation.
 
 ## v0.8.0 — 2026-09-17
 

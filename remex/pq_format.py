@@ -15,7 +15,7 @@ Layout (little-endian):
 
 This is a minimal alternative to the Python `.npz` format that is trivially
 parseable from Mojo without unzip/numpy-header machinery. See
-`remex/mojo/src/pq_format.mojo`.
+`src/pq_format.mojo` in oaustegard/remex-mojo.
 
 The flags byte lives in what byte 18 already was — reserved and zero — so
 every file written before it existed reads back as "has norms", which they
@@ -57,8 +57,8 @@ PQ_FLAG_NO_NORMS = 0x01
 # `polarquant` flag that selects each one. `--params` reads R straight out of
 # the file and is rotation-agnostic, but a caller dumping params is usually
 # also exercising the seed path, and a rotation Mojo has never heard of would
-# fail there without saying why. Keep in step with
-# `remex/mojo/src/rotation.mojo`.
+# fail there without saying why. Keep in step with `src/rotation.mojo` in
+# oaustegard/remex-mojo.
 MOJO_ROTATIONS = {"haar": "--rotation haar", "rht": "--rotation rht"}
 
 
