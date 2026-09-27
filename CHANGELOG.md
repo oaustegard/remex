@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v1.1.0 — 2026-09-27
+
+`encode` now tells you when centered mode would help. A corpus whose vectors
+share one large direction loses the most at low bit widths without it, and
+until now nothing in remex said so.
 
 ### Added
 
