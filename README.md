@@ -58,7 +58,7 @@ Three steps, each with a clear purpose:
 
 4. **Optional centering** — `Quantizer(mean=...)` encodes each vector's offset from a corpus mean you supply, and solves for the stored length so the reconstruction keeps the original vector's norm. Both halves are one feature: subtracting a mean and keeping the residual's own length *loses* recall at every bit width. The correction rides in the norms column that already exists, so a centred index costs no extra bytes per vector beyond the one stored mean.
 
-   remex never measures the mean — the caller declares it, the way it declares `scale` in scalar mode — and `remex.corpus_mean(X)` is the blessed way to compute one. Whether it pays depends on how much of your corpus is a shared direction: on SPECTER2 (raw inner product) it is worth +0.03 to +0.08 R@10, on L2-normalised all-MiniLM-L6-v2 +0.005 to +0.018, and on isotropic Gaussian vectors nothing. Measure with [`bench/centered_eval.py`](bench/centered_eval.py) before turning it on.
+   remex never measures the mean — the caller declares it, the way it declares `scale` in scalar mode — and `remex.corpus_mean(X)` is the blessed way to compute one. Whether it pays depends on how much of your corpus is a shared direction: on SPECTER2 (raw inner product) it is worth +0.03 to +0.08 R@10, on L2-normalised all-MiniLM-L6-v2 +0.005 to +0.018, and on isotropic Gaussian vectors nothing. `remex.anisotropy(X)` computes that share, `‖mean‖ / mean ‖x‖`, and `encode` raises an `AnisotropyWarning` when an uncentered encode at 4 bits or fewer sees a batch of 100+ vectors at 0.75 or above. Measure with [`bench/centered_eval.py`](bench/centered_eval.py) before turning it on.
 
 5. **Reconstruction-length correction** — Norms are stored separately as float32, but the direction they multiply is a quantized one whose own length is not 1: at 2-bit it measures 0.89-0.97 and varies per vector. Multiplying by the stored norm alone therefore reconstructs a vector about 1% off in length, per vector, which reorders any neighbours closer together than that. `renorm=True` (the default) divides the length out. It is read off the codes, so nothing extra is stored and no format changes; pass `renorm=False` to reproduce the previous behaviour.
 
@@ -133,6 +133,19 @@ against a typical vector. Near zero, centering does nothing. Reproduce with
 subtracting the mean without restoring the full length — that loses 0.03 to
 0.18 R@10 and is why the two halves ship as one feature.
 
+Two more corpora, measured as nDCG@10 on BEIR SciFact under their own scoring
+rather than R@10 (remex 1.0, default rotation, seed 0; setup in
+[`oaustegard/experiments` `mxbai-edge-remex-quant`](https://github.com/oaustegard/experiments/tree/main/mxbai-edge-remex-quant)),
+plain → centred:
+
+| corpus | ‖mean‖ / mean ‖x‖ | 1-bit | 2-bit | 4-bit |
+|---|---|---|---|---|
+| mxbai-edge-colbert-v0-32m tokens, d=64, MaxSim | 0.94 | 0.527 → 0.696 | 0.680 → 0.732 | 0.730 → 0.743 |
+| bge-small-en-v1.5, d=384 | 0.79 | 0.617 → 0.650 | 0.680 → 0.694 | 0.717 → 0.709 |
+
+The `AnisotropyWarning` threshold of 0.75 sits between bge-small (0.79,
+centering helps at 1-3 bits, neutral at 4) and all-MiniLM-L6-v2 (0.51, mixed).
+
 ### Scaling with corpus size (synthetic, 4-bit)
 
 | Corpus | R@10 | R@100 | Encode (ms) | Search (ms) |
@@ -196,7 +209,7 @@ In-memory, indices are stored as uint8 for fast search. The `PackedVectors` clas
 
 ## API reference
 
-### `Quantizer(d, bits=4, seed=42, rotation="haar", normalize=True, scale=None, renorm=True, mean=None)`
+### `Quantizer(d, bits=4, seed=42, rotation=None, normalize=True, scale=None, renorm=True, mean=None)`
 
 Main quantizer class (formerly `PolarQuantizer`, which remains available as a deprecated alias).
 
@@ -206,7 +219,7 @@ Main quantizer class (formerly `PolarQuantizer`, which remains available as a de
 - **`rotation`** — `"rht"` (default for even `d`), `"haar"` (default for odd `d`), or `"none"` (the identity — see [scalar mode](#scalar-mode-codes-as-hash-keys)). Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
 - **`normalize`** — `True` (default) factors each vector into unit direction plus a stored norm, as described above. `False` selects [scalar mode](#scalar-mode-codes-as-hash-keys): quantize the coordinates directly, store no norms. Also part of the encoding — a mismatch raises.
 - **`scale`** — Scalar mode only (default `1.0`): the coordinate standard deviation the Lloyd-Max cells are cut for. The normalizing path derives it from the unit sphere as `1/sqrt(d)` and rejects an explicit value.
-- **`mean`** — `None` (default) encodes whole vectors. A `(d,)` array turns on centered mode: codes become offsets from that mean, and the reconstruction is scaled to the original vector's length. Part of the encoding like `rotation` — every container records it and decoding against a different one raises. Requires `renorm=True`, and is rejected in scalar mode. Use `remex.corpus_mean(X)` to compute one; remex will not measure it for you.
+- **`mean`** — `None` (default) encodes whole vectors. A `(d,)` array turns on centered mode: codes become offsets from that mean, and the reconstruction is scaled to the original vector's length. Part of the encoding like `rotation` — every container records it and decoding against a different one raises. Requires `renorm=True`, and is rejected in scalar mode. Use `remex.corpus_mean(X)` to compute one; remex will not measure it for you. `encode` does measure `remex.anisotropy` on uncentered batches, but only to warn: the codes are identical either way.
 - **`renorm`** — `True` (default) divides out the decoded direction's length so a reconstruction has the norm that was stored for it. Unlike `rotation` and `normalize` this is *not* part of the encoding: it changes how codes are read, never what they are, so it is not recorded in any container and the same file decodes under either setting. `False` reproduces the previous behaviour. No effect at 1-bit, where every decoded direction has the same length.
 
 #### Methods
@@ -379,12 +392,16 @@ Choose `search()` when latency matters and RAM is available. Choose `search_adc(
 ```python
 from remex import pack, unpack, packed_nbytes
 from remex import lloyd_max_codebook, nested_codebooks
+from remex import corpus_mean, anisotropy, AnisotropyWarning
 ```
 
 - **`pack(indices, bits)`** / **`unpack(packed, bits, n_values)`** — Bit-pack/unpack uint8 arrays.
 - **`packed_nbytes(n_values, d, bits)`** — Compute packed byte count.
 - **`lloyd_max_codebook(d, bits, sigma=None)`** — Generate optimal boundaries and centroids for N(0, sigma); `sigma=None` is the unit-sphere value `1/sqrt(d)`.
 - **`nested_codebooks(d, max_bits, sigma=None)`** — Build Matryoshka centroid tables for all bit levels 1..max_bits.
+- **`corpus_mean(X)`** — The corpus mean for `Quantizer(mean=...)`, accumulated in float64.
+- **`anisotropy(X)`** — `‖mean(X)‖ / mean ‖x‖`: near 0 for isotropic data, near 1 when every vector shares one direction. Predicts what centered mode is worth. `None` for fewer than two rows or an all-zero corpus.
+- **`AnisotropyWarning`** — the `UserWarning` subclass `encode` raises at `anisotropy >= 0.75` (uncentered, `bits <= 4`, 100+ rows). Silence it with `warnings.filterwarnings("ignore", category=remex.AnisotropyWarning)`.
 
 ## Scalar mode: codes as hash keys
 

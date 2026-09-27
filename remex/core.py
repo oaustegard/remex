@@ -1,6 +1,7 @@
 """Core remex encoder/decoder with Matryoshka bit precision."""
 
 import os
+import warnings
 
 import numpy as np
 from typing import Optional, Tuple, Iterable
@@ -59,6 +60,66 @@ def corpus_mean(X: np.ndarray) -> np.ndarray:
     if X.ndim != 2:
         raise ValueError(f"expected a 2-D corpus, got shape {X.shape}")
     return X.mean(axis=0, dtype=np.float64).astype(np.float32)
+
+
+class AnisotropyWarning(UserWarning):
+    """``encode`` saw a corpus that centered mode would likely help.
+
+    Filter it with ``warnings.filterwarnings("ignore",
+    category=remex.AnisotropyWarning)`` once you have measured and decided.
+    """
+
+
+# ||mean|| / mean ||x|| at or above which an uncentered encode at <= 4 bits
+# warns. Measured centered-minus-plain (oaustegard/experiments
+# mxbai-edge-remex-quant, and bench/centered_eval.py for the R@10 rows):
+#   0.94  mxbai-edge-colbert-v0-32m tokens  +0.12 to +0.17 nDCG@10 at 1 bit, +0.03 to +0.05 at 2
+#   0.92  SPECTER2                          +0.03 to +0.08 R@10 at 1-4 bits
+#   0.79-0.82 bge-small-en-v1.5             +0.02 to +0.06 nDCG@10 at 1 bit, 0 to +0.02 at 2-3, neutral at 4
+#   0.51  all-MiniLM-L6-v2                  -0.026 R@10 at 1 bit, +0.005 to +0.018 at 2-4
+# 0.75 sits between the last two rows.
+ANISOTROPY_WARN_RATIO = 0.75
+# A batch smaller than this says too little about the corpus (a single vector
+# has ratio 1.0 by construction), so encode does not judge it.
+ANISOTROPY_MIN_ROWS = 100
+
+
+def anisotropy(X: np.ndarray) -> Optional[float]:
+    """``||mean(X)|| / mean(||x||)``: how much of a corpus is one shared direction.
+
+    Near 0 for isotropic data, near 1 when every vector points roughly the
+    same way. It predicts what centered mode (``Quantizer(mean=...)``) is
+    worth: at high values uncentered codes spend their levels on the shared
+    component. Returns ``None`` for fewer than two rows or an all-zero corpus,
+    where the ratio says nothing.
+    """
+    X = np.asarray(X)
+    if X.ndim != 2:
+        raise ValueError(f"expected a 2-D corpus, got shape {X.shape}")
+    if X.shape[0] < 2:
+        return None
+    X64 = X.astype(np.float64, copy=False)
+    mean_len = float(np.sqrt(np.sum(X64 ** 2, axis=1)).mean())
+    if mean_len == 0.0:
+        return None
+    return float(np.linalg.norm(X64.mean(axis=0)) / mean_len)
+
+
+def _warn_if_anisotropic(ratio: Optional[float], n: int, bits: int) -> None:
+    """Tell the caller about centered mode; never changes what is encoded."""
+    if ratio is None or ratio < ANISOTROPY_WARN_RATIO:
+        return
+    warnings.warn(
+        f"These {n} vectors share a large common direction "
+        f"(||mean|| / mean ||x|| = {ratio:.2f}). Uncentered {bits}-bit codes "
+        f"spend their levels on that shared component; on corpora like this, "
+        f"centered mode gained up to 0.17 recall/nDCG at 1-3 bits. Encode with "
+        f"Quantizer(..., mean=remex.corpus_mean(X)). remex.anisotropy(X) "
+        f"measures the ratio; silence this with warnings.filterwarnings("
+        f"'ignore', category=remex.AnisotropyWarning).",
+        AnisotropyWarning,
+        stacklevel=3,
+    )
 
 
 def _apply_norms(
@@ -800,6 +861,13 @@ class Quantizer:
         indices = np.empty((n, self.d), np.uint8)
         norms = np.empty(n, np.float32)
         lengths_out = None if self.mean is None else np.empty(n, np.float32)
+        # Anisotropy check for an uncentered low-bit encode. It reads the
+        # norms computed below plus a column sum, and only ever warns: the
+        # codes are the same whether or not it runs.
+        judge = (self.mean is None and self.bits <= 4
+                 and n >= ANISOTROPY_MIN_ROWS)
+        colsum = np.zeros(self.d, np.float64) if judge else None
+        norm_total = 0.0
         for lo in range(0, n, rows):
             hi = min(n, lo + rows)
             blk = X[lo:hi]
@@ -809,6 +877,9 @@ class Quantizer:
             # with the Mojo encoder.
             norms64 = np.sqrt(np.sum(blk.astype(np.float64) ** 2, axis=1))
             norms[lo:hi] = norms64.astype(np.float32)
+            if judge:
+                colsum += blk.sum(axis=0, dtype=np.float64)
+                norm_total += float(norms64.sum())
 
             target = blk if self.mean is None else blk - self.mean
             if self.mean is None:
@@ -826,6 +897,11 @@ class Quantizer:
                     indices[lo:hi], norms64, lengths
                 )
 
+        if judge and norm_total > 0.0:
+            _warn_if_anisotropic(
+                float(np.linalg.norm(colsum / n) / (norm_total / n)),
+                n, self.bits,
+            )
         if self.mean is None:
             return CompressedVectors(
                 indices, norms, self.d, self.bits, self.rotation

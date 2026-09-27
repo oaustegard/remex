@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`remex.anisotropy(X)`** returns `‖mean‖ / mean ‖x‖`, the share of a
+  corpus that is one common direction. It predicts what centered mode
+  (`Quantizer(mean=...)`) is worth.
+- **`AnisotropyWarning`.** An uncentered `encode` at 4 bits or fewer, over
+  100 or more rows, warns when that ratio is 0.75 or above and names the fix,
+  `mean=remex.corpus_mean(X)`. The codes are unchanged; the check only
+  reads norms `encode` already computes, plus one column sum. Evidence behind
+  0.75: centered mode gained +0.12 to +0.17 nDCG@10 at 1 bit on
+  mxbai-edge-colbert-v0-32m tokens (0.94), +0.03 to +0.08 R@10 on SPECTER2
+  (0.92), +0.02 to +0.06 at 1 bit on bge-small-en-v1.5 (0.79-0.82), and was
+  mixed on all-MiniLM-L6-v2 (0.51).
+
+### Docs
+
+- The `Quantizer` signature in the README said `rotation="haar"`; the 1.0
+  default is `rotation=None`, which resolves to `"rht"` for even `d`.
+
 ## v1.0.0 — 2026-09-27
 
 A breaking release. The randomized Hadamard rotation becomes the default,

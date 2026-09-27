@@ -16,6 +16,7 @@ import warnings
 
 from remex.core import (
     Quantizer, CompressedVectors, PackedVectors, corpus_mean,
+    anisotropy, AnisotropyWarning,
 )
 from remex.codebook import (
     coordinate_sigma, lloyd_max_codebook, nested_codebooks,
@@ -31,7 +32,7 @@ try:  # resolved from installed metadata, never hardcoded
 except PackageNotFoundError:  # bare source checkout, not installed
     __version__ = "0.0.0+unknown"
 __all__ = [
-    "corpus_mean",
+    "corpus_mean", "anisotropy", "AnisotropyWarning",
     "Quantizer", "CompressedVectors", "PackedVectors",
     "PolarQuantizer",  # deprecated alias
     "IVFCoarseIndex",

@@ -184,6 +184,9 @@ class TestSerialization:
         assert np.allclose(back.mean, mu)
         assert np.allclose(pq.decode(back), pq.decode(c))
 
+    # Encodes the shifted corpus uncentered on purpose, which is exactly what
+    # AnisotropyWarning exists to flag.
+    @pytest.mark.filterwarnings("ignore::remex.AnisotropyWarning")
     def test_npz_plain_roundtrip_has_no_mean(self, tmp_path):
         from remex import CompressedVectors
         X = shifted_corpus(n=300, d=64, seed=8)
