@@ -33,7 +33,10 @@ LEGACY_ROTATION = "haar"
 #: ``Quantizer(normalize=False)``, where the caller has already conditioned
 #: the coordinate distribution and wants codes that are an exact,
 #: matmul-free function of the input (see ``identity_rotation``).
-ROTATION_CODES = {"haar": 0, "rht": 1, "none": 2}
+#:
+#: ``"rht2"`` is ``"rht"`` with at least two rounds at every d (issue #89).
+#: ``"rht"`` keeps its code and its transform so files it wrote keep decoding.
+ROTATION_CODES = {"haar": 0, "rht": 1, "none": 2, "rht2": 3}
 ROTATION_BY_CODE = {code: name for name, code in ROTATION_CODES.items()}
 
 
@@ -182,7 +185,27 @@ def _largest_pow2_divisor(d: int) -> int:
     return b
 
 
-def rht_rotation(d: int, seed: int = 42) -> np.ndarray:
+#: Minimum rounds of (permute -> sign flip -> FWHT) for each randomized
+#: Hadamard rotation.
+#:
+#: ``"rht"`` takes one round when d is a power of two. Its rotate path is
+#: then ``P^-1 S H x``: a seed-dependent signed permutation of a fixed
+#: Walsh-Hadamard transform. The Lloyd-Max codebook is the same for every
+#: coordinate and symmetric about zero, so a signed permutation drops out of
+#: decode, and every seed decodes bit-identically (issue #89). A second round
+#: puts an FWHT after the first round's signs and permutation, and the seed
+#: counts. ``"rht"`` is frozen as it shipped; ``"rht2"`` is the fixed one.
+#: At any d that is not a power of two both already take two or more rounds,
+#: so they are the same transform there.
+RHT_MIN_ROUNDS = {"rht": 1, "rht2": 2}
+
+
+def _rht_rounds(d: int, B: int, min_rounds: int) -> int:
+    rounds = 1 if B == d else max(2, math.ceil(math.log(d) / math.log(B)))
+    return max(min_rounds, rounds)
+
+
+def rht_rotation(d: int, seed: int = 42, min_rounds: int = 1) -> np.ndarray:
     """Randomized Hadamard rotation, materialized as a dense (d, d) matrix.
 
     Same contract as ``haar_rotation``: a deterministic-from-seed float32
@@ -219,6 +242,9 @@ def rht_rotation(d: int, seed: int = 42) -> np.ndarray:
     Args:
         d: Matrix dimension.
         seed: Random seed. Same seed gives the same matrix.
+        min_rounds: Floor on the round count. 1 is ``"rht"`` as shipped,
+            which is seed-blind at power-of-two d; 2 is ``"rht2"``. See
+            ``RHT_MIN_ROUNDS``.
 
     Returns:
         Q: (d, d) float32 orthogonal matrix, Q @ Q.T ~ I.
@@ -230,7 +256,7 @@ def rht_rotation(d: int, seed: int = 42) -> np.ndarray:
             f"even dimension. Use rotation='haar'."
         )
     rng = np.random.default_rng(seed)
-    rounds = 1 if B == d else max(2, math.ceil(math.log(d) / math.log(B)))
+    rounds = _rht_rounds(d, B, min_rounds)
 
     # Apply the transform to the identity, one batched pass over all d rows.
     Y = np.eye(d, dtype=np.float32)
@@ -243,6 +269,11 @@ def rht_rotation(d: int, seed: int = 42) -> np.ndarray:
         _fwht_inplace(Y)
         Y = Y.reshape(d, d) * scale
     return Y
+
+
+def rht2_rotation(d: int, seed: int = 42) -> np.ndarray:
+    """``rht_rotation`` with at least two rounds at every d (issue #89)."""
+    return rht_rotation(d, seed, min_rounds=RHT_MIN_ROUNDS["rht2"])
 
 
 # ── Operator form of the randomized Hadamard rotation ────────────────────
@@ -315,8 +346,8 @@ def executor(workers: int):
         return _pool
 
 
-def rht_plan(d: int, seed: int = 42):
-    """The seed-derived structure of ``rht_rotation(d, seed)``.
+def rht_plan(d: int, seed: int = 42, min_rounds: int = 1):
+    """The seed-derived structure of ``rht_rotation(d, seed, min_rounds)``.
 
     Draws from the same PCG64 stream in the same order, so the operator and
     the materialized matrix are the same transform.
@@ -331,7 +362,7 @@ def rht_plan(d: int, seed: int = 42):
             f"even dimension. Use rotation='haar'."
         )
     rng = np.random.default_rng(seed)
-    rounds = 1 if B == d else max(2, math.ceil(math.log(d) / math.log(B)))
+    rounds = _rht_rounds(d, B, min_rounds)
     perms, signs = [], []
     for _ in range(rounds):
         perms.append(rng.permutation(d))
@@ -358,7 +389,7 @@ _FLOAT_DTYPES = (np.dtype(np.float32), np.dtype(np.float64))
 
 
 class RHTOperator:
-    """``rht_rotation(d, seed)`` applied without materializing it.
+    """``rht_rotation(d, seed, min_rounds)`` applied without materializing it.
 
     ``rotate_rows(X) == X @ R.T`` and ``unrotate_rows(X) == X @ R`` up to
     float32 rounding, for float32 or float64 input (the result keeps the
@@ -367,11 +398,11 @@ class RHTOperator:
     otherwise.
     """
 
-    def __init__(self, d: int, seed: int = 42):
+    def __init__(self, d: int, seed: int = 42, min_rounds: int = 1):
         self.d = int(d)
         self.seed = seed
         self._kernel = None  # resolved on first apply: kernel, or False for NumPy
-        B, rounds, perms, signs = rht_plan(self.d, seed)
+        B, rounds, perms, signs = rht_plan(self.d, seed, min_rounds)
         self.B, self.rounds, self.perms = B, rounds, perms
         inv_sqrt = 1.0 / math.sqrt(B)
         self._ss = {

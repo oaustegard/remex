@@ -43,7 +43,7 @@ bench/
 ```
 float32 embeddings
     → normalize (store norms separately)
-    → rotate (R @ x; "rht" applies RHTOperator instead of a matrix)
+    → rotate (R @ x; "rht"/"rht2" apply RHTOperator instead of a matrix)
     → quantize (searchsorted into Lloyd-Max boundaries → uint8 indices)
     → CompressedVectors (indices + norms)
 

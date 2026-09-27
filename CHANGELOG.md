@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`rotation="rht"` ignored the seed at every power-of-two d**
+  ([#89](https://github.com/oaustegard/remex/issues/89)). With the Hadamard
+  block spanning the whole vector it took one round, whose rotate path is a
+  fixed Walsh-Hadamard transform followed by a seed-dependent signed
+  permutation. The Lloyd-Max codebook is the same for every coordinate and
+  symmetric about zero, so the permutation dropped out of decode: at d = 64,
+  128, 256, 1024 every seed decoded bit-identically, and a Walsh-aligned
+  input stayed one-hot. `Quantizer.R` did differ by seed, which hid it from
+  checks that compare matrices. Other even d took two or more rounds and
+  were not affected.
+
+### Added
+
+- **`rotation="rht2"`**, on-disk code 3: the randomized Hadamard rotation
+  with at least two rounds at every d. At a d that is not a power of two it
+  is the same transform as `"rht"` and gives the same codes. The Mojo port
+  does not implement it, so `save_params` refuses it.
+
+### Changed
+
+- **`rotation="rht"` warns at a power-of-two d** and otherwise behaves
+  exactly as before: its codes did not move, so files it wrote keep decoding.
+  Re-encode with `"rht2"` to get a seed-dependent rotation at those d.
+
 ## v0.8.0 — 2026-09-17
 
 Six days since v0.7.0 (2026-09-11), from two pull requests, both about the
