@@ -24,6 +24,7 @@ from remex.codebook import (
 from remex.ivf import IVFCoarseIndex
 from remex.packing import pack, unpack, packed_nbytes
 from remex.pq_format import save_pq, load_pq, save_params
+from remex.st import RemexIndex, semantic_search_remex
 
 try:  # resolved from installed metadata, never hardcoded
     from importlib.metadata import version as _pkg_version, PackageNotFoundError
@@ -39,6 +40,7 @@ __all__ = [
     "coordinate_sigma", "lloyd_max_codebook", "nested_codebooks",
     "pack", "unpack", "packed_nbytes",
     "save_pq", "load_pq", "save_params",
+    "RemexIndex", "semantic_search_remex",
 ]
 
 

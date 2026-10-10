@@ -22,6 +22,35 @@ loaded = CompressedVectors.load("index.npz")
 
 The quantizer is fully determined by `(d, bits, seed, rotation, normalize, scale)` — no training, no fitting, no index to ship. `rotation` defaults to `"haar"` and is part of the encoding exactly as `seed` is; every container records it, and decoding against the wrong one raises rather than returning wrong-but-plausible vectors. `normalize` and `scale` select the pipeline described below versus [scalar mode](#scalar-mode-codes-as-hash-keys), and default to the former.
 
+
+### With sentence-transformers
+
+`RemexIndex` takes a model and a bit width and keeps the quantizer out of sight. It reads the dimension and similarity off the model, encodes documents with `encode_document` and queries with `encode_query` (so a model's prompts apply), and returns hits in the shape `util.semantic_search` does.
+
+```python
+from sentence_transformers import SentenceTransformer
+from remex import RemexIndex
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+docs = [
+    "A random rotation makes every coordinate of an embedding look Gaussian.",
+    "Lloyd-Max quantization picks the best levels for a Gaussian.",
+    "The bakery on the corner sells sourdough on Saturdays.",
+]
+
+index = RemexIndex(model, bits=4)
+index.add(docs)
+index.search("why rotate an embedding before quantizing it?", top_k=2)
+# [{'corpus_id': 0, 'score': 0.584}, {'corpus_id': 1, 'score': 0.221}]
+
+index.save("docs.npz")                    # codes + seed; not the model
+index = RemexIndex.load("docs.npz", model)
+```
+
+Against float32 `util.semantic_search` on 10,000 Natural Questions answers and 500 held-out questions with all-MiniLM-L6-v2, recall@10 is 0.860 at 2 bits (15.4x smaller), 0.948 at 4 bits (7.8x) and 0.992 at 8 bits (4x) ([`bench/st_eval.py`](bench/st_eval.py)). `center=True` is for corpora that share one large direction, which `add` warns about. `low_memory=True` scores from the codes rather than a cached float32 copy: the ranking is identical and queries are slower. `semantic_search_remex(query_embeddings, corpus_embeddings, bits=4)` is the same search behind `semantic_search_faiss`'s signature, for code that already holds embeddings.
+
+sentence-transformers is not a dependency: `pip install "remex[sentence-transformers]"` adds it, and `RemexIndex` also takes any object with an `encode` method, or no model and raw embeddings.
+
 ## How it works
 
 Three steps, each with a clear purpose:
@@ -465,6 +494,7 @@ At 3-bit, remex achieves 72-80% R@10 vs ~40% for naive scalar quantization on th
 pip install remex                       # from PyPI (when published)
 pip install -e ".[dev]"                 # development: + pytest, pytest-cov
 pip install -e ".[bench]"              # benchmarking: + faiss-cpu, sentence-transformers
+pip install "remex[sentence-transformers]"  # RemexIndex with a model by name
 ```
 
 ## Testing

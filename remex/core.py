@@ -218,19 +218,24 @@ class CompressedVectors:
         by the normalizing path has one, so there is no ambiguity with
         older files.
         """
-        packed_idx = pack(self.indices.ravel(), self.bits)
-        optional = {} if self.norms is None else {"norms": self.norms}
+        np.savez_compressed(path, **self._npz_fields())
+
+    def _npz_fields(self) -> dict:
+        """The arrays ``save`` writes, for callers that add their own keys
+        to the same file (``remex.st.RemexIndex``). ``load`` ignores keys it
+        does not know, so such a file still loads as a container."""
+        fields = {
+            "packed_indices": pack(self.indices.ravel(), self.bits),
+            "d": np.int32(self.d),
+            "bits": np.int32(self.bits),
+            "n": np.int32(self.n),
+            "rotation": np.str_(self.rotation),
+        }
+        if self.norms is not None:
+            fields["norms"] = self.norms
         if self.mean is not None:
-            optional["mean"] = self.mean
-        np.savez_compressed(
-            path,
-            packed_indices=packed_idx,
-            d=np.int32(self.d),
-            bits=np.int32(self.bits),
-            n=np.int32(self.n),
-            rotation=np.str_(self.rotation),
-            **optional,
-        )
+            fields["mean"] = self.mean
+        return fields
 
     @classmethod
     def load(cls, path: str) -> "CompressedVectors":

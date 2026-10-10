@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Added
+
+- **`remex.RemexIndex`, compressed search over a sentence-transformers
+  model.** `RemexIndex(model, bits=4)`, then `add(docs)` and
+  `search(query, top_k=10)`; the quantizer is built on the first `add` from
+  the model's dimension and `similarity_fn_name` (cosine or dot). Documents
+  go through `encode_document` and queries through `encode_query` when the
+  model has them. Results have `util.semantic_search`'s shape, a list of
+  `{"corpus_id", "score"}` per query. `save`/`load` write one `.npz` that is
+  also a plain `CompressedVectors` container, plus the seed and settings the
+  container format does not record. `center=True` encodes relative to the
+  first batch's mean, and the `AnisotropyWarning` raised through it names
+  that flag instead of `Quantizer(mean=...)`. `low_memory=True` searches
+  with `search_adc`. On 10,000 Natural Questions answers with
+  all-MiniLM-L6-v2, recall@10 against float32 `util.semantic_search` is
+  0.860 / 0.948 / 0.992 at 2 / 4 / 8 bits.
+- **`remex.semantic_search_remex`** — the same search behind
+  `semantic_search_faiss`'s signature and `(results, search_time[, index])`
+  return.
+- sentence-transformers stays optional: the
+  `remex[sentence-transformers]` extra installs it, and a model given as an
+  object is only duck-typed. CI tests the integration against a stand-in
+  model (`tests/_fake_st.py`), not torch.
+
 ### Fixed
 
 - **Centered codes read at a lower precision decoded at the wrong length.**

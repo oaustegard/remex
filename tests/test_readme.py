@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +60,13 @@ def test_readme_examples_execute(tmp_path, monkeypatch):
     from remex import PackedVectors, Quantizer
 
     monkeypatch.chdir(tmp_path)
+    # The sentence-transformers block runs against the stand-in model: CI has
+    # no torch, and a real run would download weights. What it checks is the
+    # remex side of the block, which is what drifts.
+    from _fake_st import SentenceTransformer
+    stub = types.ModuleType("sentence_transformers")
+    stub.SentenceTransformer = SentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", stub)
     ns: dict = {}
     _seed_fixtures(ns, 384)
 

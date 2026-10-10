@@ -14,6 +14,7 @@ remex/
 ├── core.py           # Quantizer, CompressedVectors (main classes)
 ├── codebook.py       # Lloyd-Max codebooks + Matryoshka nested tables
 ├── ivf.py            # IVFCoarseIndex — coarse-tier IVF, data-oblivious
+├── st.py             # RemexIndex, semantic_search_remex — sentence-transformers wrapper
 ├── packing.py        # Bit-packing for sub-byte storage (1-8 bit)
 ├── rotation.py       # Haar (QR), randomized Hadamard (dense + RHTOperator), identity
 ├── _native.py        # C kernels (RHTOperator apply, code assignment), compiled on first use
@@ -28,7 +29,8 @@ tests/
 ├── test_coverage_gaps.py  # Edge cases, save/load all bits, subset search
 ├── test_scalar_mode.py   # normalize=False: hash-key properties, rotation="none", mode guard
 ├── test_norm_correction.py # renorm: decoded length, per-precision, path agreement, recall
-└── test_centered_mode.py   # mean=: length restoration, guards, path agreement, npz
+├── test_centered_mode.py   # mean=: length restoration, guards, path agreement, npz
+└── test_st.py            # RemexIndex vs Quantizer, persistence, model surface (stand-in model)
 
 bench/
 ├── benchmark.py          # Self-contained benchmark (no external deps)
@@ -104,6 +106,7 @@ pip install -e ".[bench]"               # for real embedding benchmarks
 python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cpu
 python bench/norm_correction_eval.py    # renorm off/on; add --specter2 for the cache
 python bench/centered_eval.py           # mean= off/on; add --specter2 for the cache
+python bench/st_eval.py                 # RemexIndex vs float32 util.semantic_search
 
 # SPECTER2 (allenai/specter2_base, d=768) — encoding the transformer takes
 # ~50 min on CPU per 10k papers. Skip the encode by pulling a precomputed
@@ -128,6 +131,7 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
   bit 0). Decoding or searching across the two modes raises, like a rotation mismatch.
 - **Honest compression**: `nbytes` property uses bit-packed sizes, not uint8. Benchmark tables report packed compression ratios.
 - **Deterministic**: Same `(d, bits, seed)` must produce identical results across runs. `rotation="none"` and `rotation="rht"` strengthen this to bit-identical across machines, because no matmul enters the encoding (`"rht"` uses only gathers, multiplies and pairwise add/sub, built with `-ffp-contract=off`). `"haar"` still depends on the BLAS kernel. Codebook boundaries are midpoints of the float32 centroids for the same reason: float64 midpoints inherited ulp differences from `scipy.stats.norm` across NumPy SIMD levels.
+- **sentence-transformers is never a dependency**: `remex/st.py` imports it only to load a model by name, and duck-types a model object. CI never installs torch, so `tests/test_st.py` and the README's sentence-transformers block run against `tests/_fake_st.py`.
 - **Test thresholds**: Recall tests use conservative bounds (e.g. 2-bit R@10 >= 0.3, not exact values) because recall depends on random data.
 
 ## Key design decisions
