@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v1.2.0 — 2026-10-10
+
+`RemexIndex` puts a sentence-transformers model and a bit width in front of
+the quantizer, for single-vector and late-interaction models alike. Centered
+codes now also read correctly at a lower Matryoshka precision, so a centered
+index encoded once at 8 bits can be served at 4, 2 or 1.
 
 ### Added
 
@@ -18,6 +23,15 @@
   with `search_adc`. On 10,000 Natural Questions answers with
   all-MiniLM-L6-v2, recall@10 against float32 `util.semantic_search` is
   0.860 / 0.948 / 0.992 at 2 / 4 / 8 bits.
+- **Late interaction in `RemexIndex`.** A model whose `similarity_fn_name`
+  is `"maxsim"` or `"meanmaxsim"` — sentence-transformers'
+  `MultiVectorEncoder`, which loads pplx-embed-v2-late — gets one code per
+  token, document offsets kept alongside, and MaxSim scoring over the
+  decoded tokens in blocks bounded at 2^24 scores. `center=True` takes the
+  mean over every token of the first batch; on SciFact with
+  pplx-embed-v2-late-0.6b, centered 2-bit codes score nDCG@10 0.786 against
+  0.780 for float32. Precomputed token matrices work with
+  `similarity="maxsim"` and no model.
 - **`remex.semantic_search_remex`** — the same search behind
   `semantic_search_faiss`'s signature and `(results, search_time[, index])`
   return.

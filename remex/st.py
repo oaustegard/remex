@@ -15,6 +15,16 @@ list of ``{"corpus_id", "score"}`` dicts per query, best first. A single
 string query returns one such list, as ``model.encode`` returns one vector
 for a single string.
 
+Late-interaction models work the same way. A ``MultiVectorEncoder`` (whose
+``similarity_fn_name`` is ``"maxsim"``) yields one vector per token; the
+index stores every token's code and scores a query by MaxSim, the sum over
+query tokens of the best-matching document token::
+
+    from sentence_transformers import MultiVectorEncoder
+
+    model = MultiVectorEncoder("perplexity-ai/pplx-embed-v2-late-0.6b")
+    index = RemexIndex(model, bits=2, center=True)
+
 ``semantic_search_remex`` is the same search behind the signature of
 ``sentence_transformers.util.quantization.semantic_search_faiss``, for code
 that already holds embeddings.
@@ -39,9 +49,12 @@ from remex.core import (
 )
 from remex.packing import SUPPORTED_BITS
 
-#: Similarities a remex index can rank by. Both are inner products; cosine
-#: is an inner product of unit vectors, so inputs are normalized first.
-SIMILARITIES = ("cosine", "dot")
+#: Similarities a remex index can rank by. All are built from inner
+#: products: cosine is one of unit vectors, so inputs are normalized first,
+#: and maxsim / meanmaxsim sum each query token's best inner product over a
+#: document's tokens (meanmaxsim divides by the query's token count).
+SIMILARITIES = ("cosine", "dot", "maxsim", "meanmaxsim")
+MULTI_VECTOR = ("maxsim", "meanmaxsim")
 
 #: Version of the metadata ``RemexIndex.save`` adds to the container .npz.
 _FORMAT = 1
@@ -87,6 +100,12 @@ def _resolve_similarity(model, similarity) -> str:
     return similarity
 
 
+def _as_array(x) -> np.ndarray:
+    if hasattr(x, "detach"):  # torch tensor
+        x = x.detach().cpu().numpy()
+    return np.asarray(x, dtype=np.float32)
+
+
 def _unit_rows(X: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     return X / np.maximum(norms, 1e-12)
@@ -103,18 +122,27 @@ def _is_text(inputs) -> bool:
 class RemexIndex:
     """A compressed vector index over a sentence-transformers model.
 
+    Single-vector models are scored by inner product; late-interaction
+    models (``similarity_fn_name`` ``"maxsim"``) by MaxSim over every
+    document token's code.
+
     Args:
-        model: A ``SentenceTransformer`` (or anything with its ``encode``),
-            a model name to load, or None to add and search with
+        model: A ``SentenceTransformer`` or ``MultiVectorEncoder`` (or
+            anything with their ``encode``), a model name to load as a
+            ``SentenceTransformer``, or None to add and search with
             precomputed embeddings only.
         bits: Bits per coordinate: 1, 2, 3, 4 or 8. 4 keeps recall@10
             around 0.92 of float32 on all-MiniLM-L6-v2 at 7.8x smaller;
             8 is near-lossless at 4x.
-        similarity: ``"cosine"`` or ``"dot"``. Default: the model's
+        similarity: ``"cosine"``, ``"dot"``, or ``"maxsim"`` /
+            ``"meanmaxsim"`` for late interaction, where each document is
+            a (tokens, d) matrix. Default: the model's
             ``similarity_fn_name``, else cosine.
-        center: Encode relative to the mean of the first ``add`` batch.
-            Pays on corpora whose vectors share one large direction (remex
-            warns when it sees one); see the README's centering table.
+        center: Encode relative to the mean of the first ``add`` batch
+            (over all tokens, for late interaction). Pays on corpora whose
+            vectors share one large direction (remex warns when it sees
+            one); see the README's centering table. Late-interaction token
+            vectors usually do.
         low_memory: Score straight from the codes instead of caching a
             float32 copy of the corpus. Same ranking, less RAM, slower
             queries.
@@ -146,9 +174,19 @@ class RemexIndex:
         )
         self.quantizer: Optional[Quantizer] = None
         self.compressed: Optional[CompressedVectors] = None
+        #: Late interaction only: document i owns token rows
+        #: ``offsets[i]:offsets[i + 1]`` of ``compressed``.
+        self.offsets: Optional[np.ndarray] = None
+        self._decoded: Optional[np.ndarray] = None
+
+    @property
+    def multi_vector(self) -> bool:
+        return self.similarity in MULTI_VECTOR
 
     def __len__(self) -> int:
-        return 0 if self.compressed is None else self.compressed.n
+        if self.compressed is None:
+            return 0
+        return len(self.offsets) - 1 if self.multi_vector else self.compressed.n
 
     def __repr__(self) -> str:
         return (
@@ -168,39 +206,59 @@ class RemexIndex:
             raise ValueError("the index is empty")
         return self.compressed.compression_ratio
 
-    def _embed(self, inputs, kind: str, encode_kwargs: dict) -> np.ndarray:
-        if _is_text(inputs):
-            if self.model is None:
-                raise ValueError(
-                    "this index has no model, so it takes embeddings, not text"
-                )
-            texts = [inputs] if isinstance(inputs, str) else list(inputs)
-            encode = getattr(self.model, f"encode_{kind}", None) or self.model.encode
-            kwargs = {"convert_to_numpy": True,
-                      "normalize_embeddings": self.similarity == "cosine"}
-            kwargs.update(encode_kwargs)
-            X = encode(texts, **kwargs)
-        else:
+    def _raw(self, inputs, kind: str, encode_kwargs: dict):
+        if not _is_text(inputs):
             if encode_kwargs:
                 raise TypeError(
                     f"encode arguments {sorted(encode_kwargs)} were given "
                     f"with precomputed embeddings"
                 )
-            X = inputs
-        if hasattr(X, "detach"):  # torch tensor
-            X = X.detach().cpu().numpy()
-        X = np.asarray(X, dtype=np.float32)
+            return inputs
+        if self.model is None:
+            raise ValueError(
+                "this index has no model, so it takes embeddings, not text"
+            )
+        texts = [inputs] if isinstance(inputs, str) else list(inputs)
+        encode = getattr(self.model, f"encode_{kind}", None) or self.model.encode
+        kwargs = {"convert_to_numpy": True}
+        if not self.multi_vector:
+            kwargs["normalize_embeddings"] = self.similarity == "cosine"
+        kwargs.update(encode_kwargs)
+        return encode(texts, **kwargs)
+
+    def _check_dim(self, d: int) -> None:
+        if self.dim is None:
+            self.dim = d
+        elif d != self.dim:
+            raise ValueError(f"expected dim={self.dim}, got {d}")
+
+    def _embed(self, inputs, kind: str, encode_kwargs: dict) -> np.ndarray:
+        X = _as_array(self._raw(inputs, kind, encode_kwargs))
         if X.ndim == 1:
             X = X[np.newaxis]
         if X.ndim != 2 or X.shape[0] == 0:
             raise ValueError(f"expected a non-empty (n, d) batch, got {X.shape}")
         if self.similarity == "cosine":
             X = _unit_rows(X)
-        if self.dim is None:
-            self.dim = X.shape[1]
-        elif X.shape[1] != self.dim:
-            raise ValueError(f"expected dim={self.dim}, got {X.shape[1]}")
+        self._check_dim(X.shape[1])
         return X
+
+    def _embed_tokens(self, inputs, kind: str, encode_kwargs: dict):
+        """Late interaction: a list of (tokens, d) matrices, one per text."""
+        raw = self._raw(inputs, kind, encode_kwargs)
+        if hasattr(raw, "ndim") and raw.ndim == 2:  # one document's tokens
+            raw = [raw]
+        mats = [_as_array(m) for m in raw]
+        if not mats:
+            raise ValueError("expected at least one document")
+        for m in mats:
+            if m.ndim != 2 or m.shape[0] == 0:
+                raise ValueError(
+                    f"each document must be a non-empty (tokens, d) matrix, "
+                    f"got {m.shape}"
+                )
+            self._check_dim(m.shape[1])
+        return mats
 
     def _encode(self, X: np.ndarray) -> CompressedVectors:
         with warnings.catch_warnings(record=True) as caught:
@@ -224,8 +282,9 @@ class RemexIndex:
         """Encode and compress documents, returning their corpus ids.
 
         Args:
-            documents: Strings (encoded with the model) or an (n, d) array
-                of embeddings.
+            documents: Strings (encoded with the model), an (n, d) array
+                of embeddings, or for late interaction a list of
+                (tokens, d) matrices.
             **encode_kwargs: Passed to the model's encode, e.g.
                 ``batch_size`` or ``show_progress_bar``.
 
@@ -234,7 +293,12 @@ class RemexIndex:
         rather than one document at a time. With ``center=True`` the mean
         is taken from the first batch, so make that the bulk of the corpus.
         """
-        X = self._embed(documents, "document", encode_kwargs)
+        if self.multi_vector:
+            mats = self._embed_tokens(documents, "document", encode_kwargs)
+            X = np.concatenate(mats)
+            counts = np.array([len(m) for m in mats], dtype=np.int64)
+        else:
+            X = self._embed(documents, "document", encode_kwargs)
         if self.quantizer is None:
             mean = corpus_mean(X) if self.center else None
             self.quantizer = Quantizer(
@@ -251,48 +315,99 @@ class RemexIndex:
                 np.concatenate([old.norms, codes.norms]),
                 old.d, old.bits, old.rotation, old.mean,
             )
+        if self.multi_vector:
+            base = 0 if self.offsets is None else self.offsets[-1]
+            new = base + np.cumsum(counts)
+            self.offsets = (np.concatenate([[0], new]) if self.offsets is None
+                            else np.concatenate([self.offsets, new]))
+        self._decoded = None
         return np.arange(start, len(self))
 
     def search(self, queries, top_k: int = 10, **encode_kwargs):
         """Find the ``top_k`` best-scoring documents for each query.
 
         Args:
-            queries: A string, strings, a (d,) embedding or (n, d) embeddings.
+            queries: A string, strings, a (d,) embedding or (n, d)
+                embeddings; for late interaction, a (tokens, d) matrix or a
+                list of them.
             top_k: Results per query.
             **encode_kwargs: Passed to the model's encode.
 
         Returns:
-            For a single string or (d,) vector, one list of
+            For a single string or a single query's embedding, one list of
             ``{"corpus_id": int, "score": float}`` dicts, best first.
             Otherwise one such list per query.
         """
         if self.compressed is None:
             raise ValueError("the index is empty; add documents first")
-        single = isinstance(queries, str) or (
-            not _is_text(queries) and np.ndim(queries) == 1
-        )
-        Q = self._embed(queries, "query", encode_kwargs)
         k = min(int(top_k), len(self))
         if k < 1:
             raise ValueError(f"top_k must be at least 1, got {top_k}")
-
-        pq, codes = self.quantizer, self.compressed
-        if self.low_memory:
-            pairs = [pq.search_adc(codes, q, k=k) for q in Q]
-            idx = np.stack([p[0] for p in pairs])
-            scores = np.stack([p[1] for p in pairs])
+        if self.multi_vector:
+            single = isinstance(queries, str) or (
+                not _is_text(queries) and getattr(queries, "ndim", None) == 2
+            )
+            mats = self._embed_tokens(queries, "query", encode_kwargs)
+            idx, scores = self._search_tokens(mats, k)
         else:
-            step = max(1, _SCORE_BLOCK_FLOATS // len(self))
-            parts = [pq.search_batch(codes, Q[i:i + step], k=k)
-                     for i in range(0, len(Q), step)]
-            idx = np.concatenate([p[0] for p in parts])
-            scores = np.concatenate([p[1] for p in parts])
+            single = isinstance(queries, str) or (
+                not _is_text(queries) and np.ndim(queries) == 1
+            )
+            Q = self._embed(queries, "query", encode_kwargs)
+            idx, scores = self._search_vectors(Q, k)
 
         results = [
             [{"corpus_id": int(i), "score": float(s)} for i, s in zip(row_i, row_s)]
             for row_i, row_s in zip(idx, scores)
         ]
         return results[0] if single else results
+
+    def _search_vectors(self, Q: np.ndarray, k: int):
+        pq, codes = self.quantizer, self.compressed
+        if self.low_memory:
+            pairs = [pq.search_adc(codes, q, k=k) for q in Q]
+            return (np.stack([p[0] for p in pairs]),
+                    np.stack([p[1] for p in pairs]))
+        step = max(1, _SCORE_BLOCK_FLOATS // len(self))
+        parts = [pq.search_batch(codes, Q[i:i + step], k=k)
+                 for i in range(0, len(Q), step)]
+        return (np.concatenate([p[0] for p in parts]),
+                np.concatenate([p[1] for p in parts]))
+
+    def _decoded_tokens(self, lo: int, hi: int) -> np.ndarray:
+        """Decoded token rows lo:hi, from the cache unless ``low_memory``."""
+        if self.low_memory:
+            return self.quantizer.decode(self.compressed.subset(np.arange(lo, hi)))
+        if self._decoded is None:
+            self._decoded = self.quantizer.decode(self.compressed)
+        return self._decoded[lo:hi]
+
+    def _search_tokens(self, mats, k: int):
+        """MaxSim over decoded document tokens, in doc-aligned blocks."""
+        off = self.offsets
+        n_docs = len(off) - 1
+        out_idx = np.empty((len(mats), k), np.intp)
+        out_scores = np.empty((len(mats), k), np.float32)
+        for qi, q in enumerate(mats):
+            # widest token span per block that keeps (query tokens x span)
+            # under the score-block bound; a block holds at least one doc
+            span = max(1, _SCORE_BLOCK_FLOATS // len(q))
+            scores = np.empty(n_docs, np.float32)
+            d0 = 0
+            while d0 < n_docs:
+                d1 = max(d0 + 1, int(np.searchsorted(off, off[d0] + span, "right")) - 1)
+                d1 = min(d1, n_docs)
+                lo, hi = int(off[d0]), int(off[d1])
+                S = q @ self._decoded_tokens(lo, hi).T          # (q tokens, block tokens)
+                best = np.maximum.reduceat(S, off[d0:d1] - lo, axis=1)
+                scores[d0:d1] = best.sum(axis=0)
+                d0 = d1
+            if self.similarity == "meanmaxsim":
+                scores /= len(q)
+            top = np.argpartition(-scores, k - 1)[:k] if k < n_docs else np.arange(n_docs)
+            top = top[np.argsort(-scores[top], kind="stable")]
+            out_idx[qi], out_scores[qi] = top, scores[top]
+        return out_idx, out_scores
 
     def save(self, path: str) -> str:
         """Write the index to one ``.npz`` and return its path.
@@ -308,9 +423,10 @@ class RemexIndex:
             path += ".npz"
         meta = {"format": _FORMAT, "seed": self.seed,
                 "similarity": self.similarity, "center": self.center}
+        extra = {} if self.offsets is None else {"doc_offsets": self.offsets}
         np.savez_compressed(
             path, remex_index=np.str_(json.dumps(meta)),
-            **self.compressed._npz_fields(),
+            **self.compressed._npz_fields(), **extra,
         )
         return path
 
@@ -332,6 +448,7 @@ class RemexIndex:
                     f"does not record the seed its quantizer was built with"
                 )
             meta = json.loads(str(data["remex_index"]))
+            offsets = data["doc_offsets"] if "doc_offsets" in data else None
         if meta.get("format") != _FORMAT:
             raise ValueError(f"unsupported RemexIndex format {meta.get('format')!r}")
         codes = CompressedVectors.load(path)
@@ -350,6 +467,10 @@ class RemexIndex:
             rotation=codes.rotation, mean=codes.mean,
         )
         index.compressed = codes
+        if index.multi_vector:
+            if offsets is None:
+                raise ValueError(f"{path} is a late-interaction index with no doc_offsets")
+            index.offsets = offsets.astype(np.int64)
         return index
 
 

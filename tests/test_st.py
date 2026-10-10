@@ -255,3 +255,154 @@ class TestSemanticSearchRemex:
     def test_needs_a_corpus(self):
         with pytest.raises(ValueError, match="corpus"):
             semantic_search_remex(np.ones((1, 8), np.float32))
+
+
+# --- late interaction (MultiVectorEncoder, maxsim) -------------------------
+
+from _fake_st import FakeMultiVectorModel  # noqa: E402
+import remex.st as remex_st  # noqa: E402
+
+_WORDS = [f"w{i}" for i in range(400)]
+
+
+def _mv_docs(n=120, seed=0):
+    rng = np.random.default_rng(seed)
+    return [" ".join(rng.choice(_WORDS, rng.integers(3, 25))) for _ in range(n)]
+
+
+MV_DOCS = _mv_docs()
+MV_QUERIES = [" ".join(d.split()[:4]) for d in MV_DOCS[:10]]
+
+
+def _maxsim(q, docs):
+    return np.array([(q @ d.T).max(axis=1).sum() for d in docs])
+
+
+@pytest.fixture
+def mv_model():
+    return FakeMultiVectorModel(dim=32)
+
+
+@pytest.fixture
+def mv_index(mv_model):
+    idx = RemexIndex(mv_model, bits=4)
+    idx.add(MV_DOCS)
+    return idx
+
+
+class TestLateInteraction:
+    def test_similarity_and_length_come_from_the_model(self, mv_index):
+        assert mv_index.multi_vector
+        assert len(mv_index) == len(MV_DOCS)
+        assert mv_index.offsets[-1] == mv_index.compressed.n
+
+    def test_scores_are_maxsim_over_decoded_tokens(self, mv_model, mv_index):
+        decoded = mv_index.quantizer.decode(mv_index.compressed)
+        off = mv_index.offsets
+        docs = [decoded[off[i]:off[i + 1]] for i in range(len(MV_DOCS))]
+        for text in MV_QUERIES:
+            q = mv_model.encode([text])[0]
+            want = _maxsim(q, docs)
+            hits = mv_index.search(text, top_k=5)
+            np.testing.assert_allclose(
+                [h["score"] for h in hits], np.sort(want)[::-1][:5], rtol=1e-5)
+            assert [h["corpus_id"] for h in hits][0] == int(np.argmax(want))
+
+    def test_8bit_recall_against_float_maxsim(self, mv_model):
+        docs = mv_model.encode(MV_DOCS)
+        idx = RemexIndex(mv_model, bits=8)
+        idx.add(MV_DOCS)
+        recall = []
+        for text in MV_QUERIES:
+            exact = set(np.argsort(-_maxsim(mv_model.encode([text])[0], docs))[:10])
+            got = {h["corpus_id"] for h in idx.search(text, top_k=10)}
+            recall.append(len(exact & got) / 10)
+        assert np.mean(recall) >= 0.9
+
+    def test_query_matrix_and_list_of_matrices(self, mv_model, mv_index):
+        q = mv_model.encode(MV_QUERIES[:2])
+        assert len(mv_index.search(q[0], top_k=3)) == 3            # one query
+        assert len(mv_index.search(q, top_k=3)) == 2               # two queries
+        assert mv_index.search(q[0], top_k=3) == mv_index.search(MV_QUERIES[0], top_k=3)
+
+    def test_blocking_does_not_change_results(self, mv_index, monkeypatch):
+        whole = mv_index.search(MV_QUERIES, top_k=10)
+        monkeypatch.setattr(remex_st, "_SCORE_BLOCK_FLOATS", 64)  # a few docs per block
+        blocked = mv_index.search(MV_QUERIES, top_k=10)
+        # block shape changes BLAS summation order, so scores agree to rounding
+        assert [[h["corpus_id"] for h in r] for r in blocked] == \
+               [[h["corpus_id"] for h in r] for r in whole]
+        np.testing.assert_allclose([[h["score"] for h in r] for r in blocked],
+                                   [[h["score"] for h in r] for r in whole], rtol=1e-5)
+
+    def test_low_memory_identical(self, mv_model, mv_index):
+        lm = RemexIndex(mv_model, bits=4, low_memory=True)
+        lm.add(MV_DOCS)
+        assert lm.search(MV_QUERIES, top_k=10) == mv_index.search(MV_QUERIES, top_k=10)
+        assert lm._decoded is None
+
+    def test_incremental_add(self, mv_model, mv_index):
+        idx = RemexIndex(mv_model, bits=4)
+        assert list(idx.add(MV_DOCS[:50])) == list(range(50))
+        assert list(idx.add(MV_DOCS[50:])) == list(range(50, len(MV_DOCS)))
+        np.testing.assert_array_equal(idx.offsets, mv_index.offsets)
+        assert idx.search(MV_QUERIES, top_k=10) == mv_index.search(MV_QUERIES, top_k=10)
+
+    def test_add_invalidates_decoded_cache(self, mv_model):
+        idx = RemexIndex(mv_model, bits=4)
+        idx.add(MV_DOCS[:50])
+        idx.search(MV_QUERIES[0])
+        idx.add(MV_DOCS[50:])
+        assert idx.search(MV_QUERIES[0], top_k=1)[0]["corpus_id"] == 0
+
+    def test_meanmaxsim_divides_by_query_tokens(self, mv_model, mv_index):
+        idx = RemexIndex(mv_model, bits=4, similarity="meanmaxsim")
+        idx.add(MV_DOCS)
+        a = mv_index.search(MV_QUERIES[0], top_k=5)
+        b = idx.search(MV_QUERIES[0], top_k=5)
+        n_tok = len(MV_QUERIES[0].split())
+        assert [h["corpus_id"] for h in a] == [h["corpus_id"] for h in b]
+        np.testing.assert_allclose([h["score"] / n_tok for h in a],
+                                   [h["score"] for h in b], rtol=1e-5)
+
+    def test_token_matrices_without_model(self, mv_model):
+        idx = RemexIndex(bits=4, similarity="maxsim")
+        idx.add(mv_model.encode(MV_DOCS))
+        assert idx.dim == 32
+        assert idx.search(mv_model.encode([MV_DOCS[7]])[0], top_k=1)[0]["corpus_id"] == 7
+
+    def test_empty_document_refused(self):
+        idx = RemexIndex(bits=4, similarity="maxsim")
+        with pytest.raises(ValueError, match="non-empty"):
+            idx.add([np.ones((3, 8), np.float32), np.ones((0, 8), np.float32)])
+
+    def test_shared_direction_warns_toward_center(self):
+        model = FakeMultiVectorModel(dim=32, shared=3.0)
+        with pytest.warns(AnisotropyWarning, match=r"center=True"):
+            RemexIndex(model, bits=2).add(MV_DOCS)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", AnisotropyWarning)
+            RemexIndex(model, bits=2, center=True).add(MV_DOCS)
+
+    def test_centering_helps_on_shared_direction(self):
+        model = FakeMultiVectorModel(dim=32, shared=3.0)
+        docs = model.encode(MV_DOCS)
+        exact = [set(np.argsort(-_maxsim(model.encode([q])[0], docs))[:10])
+                 for q in MV_QUERIES]
+
+        def recall(center):
+            idx = RemexIndex(model, bits=1, center=center)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", AnisotropyWarning)
+                idx.add(MV_DOCS)
+            got = idx.search(MV_QUERIES, top_k=10)
+            return np.mean([len(e & {h["corpus_id"] for h in g}) / 10
+                            for e, g in zip(exact, got)])
+
+        assert recall(True) > recall(False)
+
+    def test_round_trip(self, mv_model, mv_index, tmp_path):
+        again = RemexIndex.load(mv_index.save(tmp_path / "mv"), mv_model)
+        assert again.multi_vector
+        np.testing.assert_array_equal(again.offsets, mv_index.offsets)
+        assert again.search(MV_QUERIES, top_k=10) == mv_index.search(MV_QUERIES, top_k=10)

@@ -49,6 +49,20 @@ index = RemexIndex.load("docs.npz", model)
 
 Against float32 `util.semantic_search` on 10,000 Natural Questions answers and 500 held-out questions with all-MiniLM-L6-v2, recall@10 is 0.860 at 2 bits (15.4x smaller), 0.948 at 4 bits (7.8x) and 0.992 at 8 bits (4x) ([`bench/st_eval.py`](bench/st_eval.py)). `center=True` is for corpora that share one large direction, which `add` warns about. `low_memory=True` scores from the codes rather than a cached float32 copy: the ranking is identical and queries are slower. `semantic_search_remex(query_embeddings, corpus_embeddings, bits=4)` is the same search behind `semantic_search_faiss`'s signature, for code that already holds embeddings.
 
+Late-interaction (ColBERT-style) models go through the same class. sentence-transformers' `MultiVectorEncoder` reports `similarity_fn_name == "maxsim"`, and `RemexIndex` then stores one code per token and scores a query by MaxSim: for each query token, the best inner product with any of the document's tokens, summed.
+
+```python
+from sentence_transformers import MultiVectorEncoder
+from remex import RemexIndex
+
+model = MultiVectorEncoder("perplexity-ai/pplx-embed-v2-late-0.6b")
+index = RemexIndex(model, bits=2, center=True)
+index.add(docs)
+index.search("which step makes coordinates Gaussian?", top_k=2)
+```
+
+Token vectors from these models tend to share one large direction, so `center=True` matters more here than for single-vector models. On BEIR SciFact with pplx-embed-v2-late-0.6b, centered 2-bit codes scored nDCG@10 0.786 against 0.780 for float32, at 9.6 KB per document instead of 154 KB; uncentered 1-bit codes lost 0.21 ([writeup](https://muninn.austegard.com/blog/sixteen-times-smaller-pplx-late-index.html)). The index decodes the token codes to float32 once for scoring, so query-time memory is the float32 size unless `low_memory=True`, which decodes one block at a time on every query.
+
 sentence-transformers is not a dependency: `pip install "remex[sentence-transformers]"` adds it, and `RemexIndex` also takes any object with an `encode` method, or no model and raw embeddings.
 
 ## How it works

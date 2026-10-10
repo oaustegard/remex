@@ -30,7 +30,7 @@ tests/
 ├── test_scalar_mode.py   # normalize=False: hash-key properties, rotation="none", mode guard
 ├── test_norm_correction.py # renorm: decoded length, per-precision, path agreement, recall
 ├── test_centered_mode.py   # mean=: length restoration, guards, path agreement, npz
-└── test_st.py            # RemexIndex vs Quantizer, persistence, model surface (stand-in model)
+└── test_st.py            # RemexIndex vs Quantizer, MaxSim, persistence, model surface (stand-in models)
 
 bench/
 ├── benchmark.py          # Self-contained benchmark (no external deps)

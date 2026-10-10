@@ -45,3 +45,36 @@ class SentenceTransformer(FakeModel):
 
     def __init__(self, model_name_or_path="fake", **kwargs):
         super().__init__(name=model_name_or_path)
+
+
+class FakeMultiVectorModel:
+    """Stands in for ``sentence_transformers.MultiVectorEncoder``: one
+    deterministic unit vector per word, so a document is a (words, dim)
+    matrix and repeated words repeat their vector."""
+
+    similarity_fn_name = "maxsim"
+
+    def __init__(self, dim=32, shared=0.0):
+        self.dim = dim
+        self.shared = shared  # weight of one direction every token shares
+        self.calls = []
+
+    def get_embedding_dimension(self):
+        return self.dim
+
+    def _tok(self, word):
+        rng = np.random.default_rng(zlib.crc32(word.encode("utf-8")))
+        v = rng.standard_normal(self.dim) + self.shared
+        return (v / np.linalg.norm(v)).astype(np.float32)
+
+    def encode(self, sentences, convert_to_numpy=True, **kwargs):
+        self.calls.append(("encode", len(sentences), kwargs))
+        return [np.stack([self._tok(w) for w in s.split()]) for s in sentences]
+
+    def encode_query(self, sentences, **kwargs):
+        self.calls.append(("query", len(sentences)))
+        return self.encode(sentences, **kwargs)
+
+    def encode_document(self, sentences, **kwargs):
+        self.calls.append(("document", len(sentences)))
+        return self.encode(sentences, **kwargs)
