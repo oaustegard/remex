@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Centered codes read at a lower precision decoded at the wrong length.**
+  `Quantizer(mean=...)` stores a length `m` that solves
+  `||mu + m*u_hat|| == ||x||` for the full-precision direction, and
+  `decode(precision=p)`, `search(precision=p)`, `search_adc`, the IVF and GPU
+  paths all reused that `m` with the coarser p-bit direction. With a dominant
+  mean the solve is steep in `mu . u_hat`: on pplx-embed-v2-late-0.6b token
+  vectors (`anisotropy` 0.945, BEIR SciFact, MaxSim) a 1-bit read of a
+  centered 8-bit code scored nDCG@10 0.527 against 0.765 for a direct 1-bit
+  encode, and a 2-bit read 0.737 against 0.786. `m` is now re-solved per
+  precision from the `||x||` the full code already determines: nothing is
+  stored, no container format changes, and full-precision decodes are
+  bit-identical to before. After the fix the 1-bit read scores 0.765 and the
+  2-bit read 0.780. Uncentered codes are unaffected.
+
 ## v1.1.0 — 2026-09-27
 
 `encode` now tells you when centered mode would help. A corpus whose vectors

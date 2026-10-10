@@ -164,7 +164,7 @@ class CompressedVectors:
         #: different one is refused rather than silently wrong.
         self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
         self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
-        self._dir_len = {}  # precision -> (n,) length of the decoded direction
+        self._dir_len = {}  # precision -> (n,) decoded-direction length; ("centred", p) -> re-solved m
 
     @property
     def has_norms(self) -> bool:
@@ -334,7 +334,7 @@ class PackedVectors:
         self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
         self._row_bytes = packed_nbytes(1, d, bits)
         self._row_aligned = (d * bits) % 8 == 0
-        self._dir_len = {}  # precision -> (n,) length of the decoded direction
+        self._dir_len = {}  # precision -> (n,) decoded-direction length; ("centred", p) -> re-solved m
 
     @property
     def has_norms(self) -> bool:
@@ -1150,7 +1150,73 @@ class Quantizer:
         if compressed.norms is None or not self.renorm:
             return compressed.norms
         lengths = self._direction_lengths(compressed, precision)
-        return compressed.norms / np.maximum(lengths, 1e-12)
+        norms = compressed.norms
+        if self.mean is not None and precision is not None and precision != self.bits:
+            norms = self._centred_lengths_at(compressed, precision)
+        return norms / np.maximum(lengths, 1e-12)
+
+    def _direction_mean_dots(
+        self, compressed, precision: Optional[int], mu_rot: np.ndarray
+    ) -> np.ndarray:
+        """``v . R mu`` per row, ``v`` the raw (unnormalised) decoded direction
+        in rotated space. Equals ``unrotate(v) . mu`` because R is orthogonal.
+        Chunked like ``_direction_lengths`` so no (n, d) float64 is built."""
+        centroids = self._resolve_centroids(compressed, precision).astype(np.float64)
+        shift = (
+            0 if (precision is None or precision == self.bits)
+            else (self.bits - precision)
+        )
+        n = compressed.n
+        out = np.empty(n, dtype=np.float64)
+        for start in range(0, n, 4096):
+            end = min(start + 4096, n)
+            if isinstance(compressed, PackedVectors):
+                chunk = compressed.unpack_rows(start, end)
+            else:
+                chunk = compressed.indices[start:end]
+            if shift > 0:
+                chunk = chunk >> shift
+            out[start:end] = centroids[chunk] @ mu_rot
+        return out
+
+    def _centred_lengths_at(self, compressed, precision: int) -> np.ndarray:
+        """The stored centred length, re-solved for a lower precision.
+
+        ``_centred_lengths`` solves ``||mu + m*u_hat|| == ||x||`` for the
+        full-precision direction. A Matryoshka level decodes a different
+        direction, and the same ``m`` then reconstructs a vector of the wrong
+        length -- with a dominant mean the solve is steep in ``mu . u_hat``, so
+        a 1-bit read of an 8-bit code lost 0.24 nDCG@10 on
+        pplx-embed-v2-late tokens against a direct 1-bit encode.
+
+        ``||x||`` is recoverable from the full-precision code, so ``m`` is
+        re-solved per level with the same quadratic and the same fallback
+        (keep the stored length where no positive root exists). Nothing is
+        stored. Cached on the container under ``("centred", precision)``.
+        """
+        key = ("centred", precision)
+        cached = compressed._dir_len.get(key)
+        if cached is not None:
+            return cached
+
+        mu = self.mean.astype(np.float64)
+        mu_rot = self._rotate_rows(self.mean[np.newaxis].astype(np.float32))[0]
+        mu_rot = mu_rot.astype(np.float64)
+        m = compressed.norms.astype(np.float64)
+        mu_sq = float(mu @ mu)
+
+        len_full = np.maximum(self._direction_lengths(compressed, None), 1e-12)
+        b_full = self._direction_mean_dots(compressed, None, mu_rot) / len_full
+        x_sq = mu_sq + 2.0 * m * b_full + m * m      # ||decode(x)||^2
+
+        len_p = np.maximum(self._direction_lengths(compressed, precision), 1e-12)
+        b_p = self._direction_mean_dots(compressed, precision, mu_rot) / len_p
+        disc = b_p * b_p - (mu_sq - x_sq)
+        m_p = np.where(disc > 0.0, -b_p + np.sqrt(np.maximum(disc, 0.0)), m)
+
+        out = m_p.astype(np.float32)
+        compressed._dir_len[key] = out
+        return out
 
     def decode(
         self, compressed: CompressedVectors, precision: Optional[int] = None

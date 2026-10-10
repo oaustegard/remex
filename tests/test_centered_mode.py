@@ -80,6 +80,63 @@ class TestReconstruction:
         assert Quantizer(d=X.shape[1], bits=4, seed=42).encode(X).mean is None
 
 
+class TestNestedPrecision:
+    """A centred code read at a lower Matryoshka precision.
+
+    The stored length ``m`` solves ``||mu + m*u_hat|| == ||x||`` for the
+    full-precision direction. Reused unchanged with a coarser direction, the
+    reconstruction lands at the wrong length; on pplx-embed-v2-late tokens
+    (||mean|| / mean ||x|| = 0.945) that took a 1-bit read of an 8-bit code
+    from nDCG@10 0.765 to 0.527. ``||x||`` is recoverable from the full code,
+    so ``m`` is re-solved per precision with no stored bytes.
+    """
+
+    @pytest.mark.parametrize("p", [1, 2, 3, 4, 6, 7])
+    def test_nested_decode_restores_length(self, p):
+        X = shifted_corpus()
+        pq = Quantizer(d=X.shape[1], bits=8, seed=42, mean=remex.corpus_mean(X))
+        recon = pq.decode(pq.encode(X), precision=p)
+        assert np.allclose(np.linalg.norm(recon, axis=1),
+                           np.linalg.norm(X, axis=1), rtol=1e-3)
+
+    def test_nested_1bit_equals_standalone_1bit(self):
+        """The MSB of a centred 8-bit code is the centred 1-bit code, and with
+        ``m`` re-solved the two decode to the same vectors."""
+        X = shifted_corpus(seed=5)
+        mu = remex.corpus_mean(X)
+        q8 = Quantizer(d=X.shape[1], bits=8, seed=42, mean=mu)
+        q1 = Quantizer(d=X.shape[1], bits=1, seed=42, mean=mu)
+        c8, c1 = q8.encode(X), q1.encode(X)
+        assert np.array_equal(c8.indices >> 7, c1.indices)
+        assert np.allclose(q8.decode(c8, precision=1), q1.decode(c1),
+                           rtol=1e-4, atol=1e-5)
+
+    def test_full_precision_is_untouched(self):
+        X = shifted_corpus(seed=6)
+        pq = Quantizer(d=X.shape[1], bits=4, seed=42, mean=remex.corpus_mean(X))
+        c = pq.encode(X)
+        assert np.array_equal(pq.decode(c), pq.decode(c, precision=4))
+
+    @pytest.mark.parametrize("p", [1, 2])
+    def test_nested_paths_agree(self, p):
+        from remex import IVFCoarseIndex, PackedVectors
+        from remex.gpu import GPUSearcher
+        X = shifted_corpus(n=800, d=64, seed=13)
+        pq = Quantizer(d=X.shape[1], bits=4, seed=42, mean=remex.corpus_mean(X))
+        c = pq.encode(X)
+        q = X[31]
+        i_a, s_a = pq.search_adc(c, q, k=10, precision=p)
+        assert np.allclose(s_a, pq.decode(c, precision=p)[i_a] @ q, rtol=1e-3, atol=1e-4)
+        i_p, s_p = pq.search_adc(PackedVectors.from_compressed(c), q, k=10, precision=p)
+        assert np.array_equal(i_a, i_p) and np.allclose(s_a, s_p, rtol=1e-4, atol=1e-5)
+        i_c, s_c = pq.search(c, q, k=10, precision=p)
+        assert np.array_equal(i_a, i_c) and np.allclose(s_a, s_c, rtol=1e-4, atol=1e-4)
+        i_i, s_i = IVFCoarseIndex(pq, c, n_bits=4).search_coarse(q, k=10, nprobe=16, precision=p)
+        assert np.array_equal(i_a, i_i) and np.allclose(s_a, s_i, rtol=1e-4, atol=1e-4)
+        i_g, s_g = GPUSearcher(pq, c, backend="numpy").search_adc(q, k=10, precision=p)
+        assert np.array_equal(i_a, i_g) and np.allclose(s_a, s_g, rtol=1e-4, atol=1e-4)
+
+
 class TestGuards:
     def test_decoding_centered_codes_without_the_mean_raises(self):
         X = shifted_corpus()
