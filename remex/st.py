@@ -314,6 +314,8 @@ class RemexIndex:
                 np.concatenate([old.indices, codes.indices]),
                 np.concatenate([old.norms, codes.norms]),
                 old.d, old.bits, old.rotation, old.mean,
+                None if old.mean_dots is None
+                else np.concatenate([old.mean_dots, codes.mean_dots]),
             )
         if self.multi_vector:
             base = 0 if self.offsets is None else self.offsets[-1]
@@ -374,13 +376,16 @@ class RemexIndex:
         return (np.concatenate([p[0] for p in parts]),
                 np.concatenate([p[1] for p in parts]))
 
-    def _decoded_tokens(self, lo: int, hi: int) -> np.ndarray:
-        """Decoded token rows lo:hi, from the cache unless ``low_memory``."""
+    def _decoded_tokens(self, lo: int, hi: int):
+        """Scoring rows lo:hi and their bias (``Quantizer._score_vectors``),
+        from the cache unless ``low_memory``."""
         if self.low_memory:
-            return self.quantizer.decode(self.compressed.subset(np.arange(lo, hi)))
+            return self.quantizer._score_vectors(
+                self.compressed.subset(np.arange(lo, hi)))
         if self._decoded is None:
-            self._decoded = self.quantizer.decode(self.compressed)
-        return self._decoded[lo:hi]
+            self._decoded = self.quantizer._score_vectors(self.compressed)
+        Y, bias = self._decoded
+        return Y[lo:hi], None if bias is None else bias[lo:hi]
 
     def _search_tokens(self, mats, k: int):
         """MaxSim over decoded document tokens, in doc-aligned blocks."""
@@ -398,7 +403,10 @@ class RemexIndex:
                 d1 = max(d0 + 1, int(np.searchsorted(off, off[d0] + span, "right")) - 1)
                 d1 = min(d1, n_docs)
                 lo, hi = int(off[d0]), int(off[d1])
-                S = q @ self._decoded_tokens(lo, hi).T          # (q tokens, block tokens)
+                Y, bias = self._decoded_tokens(lo, hi)
+                S = q @ Y.T                                     # (q tokens, block tokens)
+                if bias is not None:
+                    S += bias
                 best = np.maximum.reduceat(S, off[d0:d1] - lo, axis=1)
                 scores[d0:d1] = best.sum(axis=0)
                 d0 = d1
@@ -452,6 +460,12 @@ class RemexIndex:
         if meta.get("format") != _FORMAT:
             raise ValueError(f"unsupported RemexIndex format {meta.get('format')!r}")
         codes = CompressedVectors.load(path)
+        if codes.mean is not None and codes.mean_dots is None:
+            raise ValueError(
+                f"{path} is a centred index written by remex < 2.0, whose "
+                "centred format stored a different per-row length. Rebuild "
+                "it with this version (add the documents again)."
+            )
         index = cls(model, bits=codes.bits, similarity=meta["similarity"],
                     center=meta["center"], low_memory=low_memory,
                     seed=meta["seed"], dim=codes.d)

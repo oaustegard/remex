@@ -99,7 +99,7 @@ Three steps, each with a clear purpose:
 
 3. **Bit-packing** — Indices are stored at their actual bit width (not wasteful uint8), giving honest compression ratios. A 4-bit codebook uses 4 bits per coordinate on disk.
 
-4. **Optional centering** — `Quantizer(mean=...)` encodes each vector's offset from a corpus mean you supply, and solves for the stored length so the reconstruction keeps the original vector's norm. Both halves are one feature: subtracting a mean and keeping the residual's own length *loses* recall at every bit width. The correction rides in the norms column that already exists, so a centred index costs no extra bytes per vector beyond the one stored mean.
+4. **Optional centering** — `Quantizer(mean=...)` encodes each vector's offset `r = x - mu` from a corpus mean you supply, and stores two floats per row: `||r||` and `mu . r`. Search scores `q.mu + mu.r + ||r|| (q - mu).u_hat / kappa`, the estimator faiss's RaBitQ uses: `mu . r` is exact, the quantised term is multiplied by `||q - mu||` rather than `||q||`, and `kappa` is the expected cosine of a Lloyd-Max code. On SPECTER2 that puts centred remex level with faiss `IndexRaBitQ` at 12 fewer bytes per vector from 2 bits up ([comparison](https://github.com/oaustegard/experiments/tree/main/rabitq-vs-remex)). `decode` reconstructs `w mu + kappa ||r|| u_hat`, the lower-error reconstruction, with `w` making the mean component exact. Reconstruction and search are two different estimates: ranking by `q . decode(x)` loses 0.15 recall@10 at 1 bit on SPECTER2.
 
    remex never measures the mean — the caller declares it, the way it declares `scale` in scalar mode — and `remex.corpus_mean(X)` is the blessed way to compute one. Whether it pays depends on how much of your corpus is a shared direction: on SPECTER2 (raw inner product) it is worth +0.03 to +0.08 R@10, on L2-normalised all-MiniLM-L6-v2 +0.005 to +0.018, and on isotropic Gaussian vectors nothing. `remex.anisotropy(X)` computes that share, `‖mean‖ / mean ‖x‖`, and `encode` raises an `AnisotropyWarning` when an uncentered encode at 4 bits or fewer sees a batch of 100+ vectors at 0.75 or above. Measure with [`bench/centered_eval.py`](bench/centered_eval.py) before turning it on.
 
@@ -165,10 +165,14 @@ harness. Both FAISS scoring paths — `index.search` and reconstruct-then-score
 
 | corpus | ‖mean‖ / mean ‖x‖ | 1-bit | 2-bit | 3-bit | 4-bit | 8-bit |
 |---|---|---|---|---|---|---|
-| SPECTER2 broad, 9.5k, d=768 | 0.92 | 0.637 → 0.686 | 0.773 → 0.852 | 0.864 → 0.913 | 0.917 → 0.949 | 0.994 → 0.996 |
-| SPECTER2 narrow, 9.5k, d=768 | 0.92 | 0.670 → 0.706 | 0.789 → 0.858 | 0.869 → 0.920 | 0.922 → 0.958 | 0.993 → 0.998 |
-| all-MiniLM-L6-v2, 10k, d=384 | 0.51 | 0.635 → 0.609 | 0.759 → 0.777 | 0.862 → 0.868 | 0.919 → 0.924 | 0.992 → 0.992 |
-| synthetic gaussian, 9.5k | 0.01 | 0.258 → 0.254 | 0.540 → 0.542 | 0.732 → 0.728 | 0.860 → 0.858 | 0.990 → 0.989 |
+| SPECTER2 broad, 9.5k, d=768 | 0.92 | 0.624 → 0.812 | 0.765 → 0.903 | 0.864 → 0.943 | 0.923 → 0.967 | 0.995 → 0.998 |
+| SPECTER2 narrow, 9.5k, d=768 | 0.92 | 0.668 → 0.828 | 0.789 → 0.905 | 0.868 → 0.947 | 0.926 → 0.970 | 0.994 → 0.997 |
+| all-MiniLM-L6-v2, 10k, d=384 | 0.51 | 0.615 → 0.645 | 0.757 → 0.782 | 0.853 → 0.871 | 0.918 → 0.927 | 0.990 → 0.995 |
+| synthetic gaussian, 9.5k | 0.01 | 0.254 → 0.258 | 0.537 → 0.539 | 0.737 → 0.735 | 0.857 → 0.855 | 0.988 → 0.987 |
+
+remex 2.0 search, seed 42. Under 1.x, which ranked centred codes by
+`q . decode(x)`, the SPECTER2 broad centred column was
+0.689 / 0.853 / 0.917 / 0.953 / 0.996.
 
 The second column is what predicts the gain: how long the corpus mean is
 against a typical vector. Near zero, centering does nothing. Reproduce with
@@ -262,7 +266,7 @@ Main quantizer class (formerly `PolarQuantizer`, which remains available as a de
 - **`rotation`** — `"rht"` (default for even `d`), `"haar"` (default for odd `d`), or `"none"` (the identity — see [scalar mode](#scalar-mode-codes-as-hash-keys)). Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
 - **`normalize`** — `True` (default) factors each vector into unit direction plus a stored norm, as described above. `False` selects [scalar mode](#scalar-mode-codes-as-hash-keys): quantize the coordinates directly, store no norms. Also part of the encoding — a mismatch raises.
 - **`scale`** — Scalar mode only (default `1.0`): the coordinate standard deviation the Lloyd-Max cells are cut for. The normalizing path derives it from the unit sphere as `1/sqrt(d)` and rejects an explicit value.
-- **`mean`** — `None` (default) encodes whole vectors. A `(d,)` array turns on centered mode: codes become offsets from that mean, and the reconstruction is scaled to the original vector's length. Part of the encoding like `rotation` — every container records it and decoding against a different one raises. Requires `renorm=True`, and is rejected in scalar mode. Use `remex.corpus_mean(X)` to compute one; remex will not measure it for you. `encode` does measure `remex.anisotropy` on uncentered batches, but only to warn: the codes are identical either way.
+- **`mean`** — `None` (default) encodes whole vectors. A `(d,)` array turns on centered mode: codes become offsets from that mean, containers gain a `mean_dots` column (`mu . (x - mu)`, 4 B per vector), search scores the centred estimator above, and `decode` returns the reconstruction described there. Containers written by remex < 2.0 in centered mode are refused; re-encode them. Part of the encoding like `rotation` — every container records it and decoding against a different one raises. Requires `renorm=True`, and is rejected in scalar mode. Use `remex.corpus_mean(X)` to compute one; remex will not measure it for you. `encode` does measure `remex.anisotropy` on uncentered batches, but only to warn: the codes are identical either way.
 - **`renorm`** — `True` (default) divides out the decoded direction's length so a reconstruction has the norm that was stored for it. Unlike `rotation` and `normalize` this is *not* part of the encoding: it changes how codes are read, never what they are, so it is not recorded in any container and the same file decodes under either setting. `False` reproduces the previous behaviour. No effect at 1-bit, where every decoded direction has the same length.
 
 #### Methods
@@ -310,7 +314,7 @@ from remex import PackedVectors
 
 packed = PackedVectors.from_compressed(compressed)  # pack in memory
 # from DB rows; rows carry no rotation record, so name the one that wrote them
-packed = PackedVectors.from_rows(rows, norms, d=384, bits=4, rotation=pq.rotation)
+packed = PackedVectors.from_rows(rows, norms, d=384, bits=pq.bits, rotation=pq.rotation)
 
 # ADC and two-stage search work directly on PackedVectors
 indices, scores = pq.search_adc(packed, query, k=10)

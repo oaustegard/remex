@@ -211,7 +211,8 @@ class _TorchOps:
         return self._torch
 
     def to_device(self, arr: np.ndarray):
-        return self._torch.from_numpy(arr).to(self.device)
+        # from_numpy refuses negative strides; a reversed view is valid input
+        return self._torch.from_numpy(np.ascontiguousarray(arr)).to(self.device)
 
     def to_numpy(self, arr):
         return arr.cpu().numpy()
@@ -287,6 +288,12 @@ class GPUSearcher:
         self.ops = _make_ops(self.backend_name)
         self._pq = quantizer
         self._compressed = compressed
+        # The CPU paths run these guards in _resolve_centroids; the device
+        # path builds its own tables, so it runs them here.
+        quantizer._check_mode(compressed)
+        quantizer._check_rotation(compressed)
+        quantizer._check_bits(compressed)
+        quantizer._check_mean(compressed)
 
         # Move static data to device
         self._R = self.ops.to_device(quantizer.R.astype(np.float32))
@@ -296,7 +303,7 @@ class GPUSearcher:
         # in the reconstruction-length correction; they differ per
         # precision, so a Matryoshka level gets its own device copy.
         self._norm_cache = {}
-        self._norms = self._device_norms(None)
+        self._norms = self._device_norms(None)[0]
 
         # Indices: keep as int type appropriate for backend
         if self.backend_name == "torch":
@@ -331,7 +338,12 @@ class GPUSearcher:
         idx_bytes = self._n * self._d  # uint8 or int64
         if self.backend_name == "torch":
             idx_bytes *= 8  # int64
-        norm_bytes = 0 if self._norms is None else self._n * 4
+        norm_bytes = 0
+        for scale, bias in self._norm_cache.values():
+            if scale is not None:
+                norm_bytes += self._n * 4
+            if bias is not None:
+                norm_bytes += self._n * 4
         R_bytes = self._d * self._d * 4
         cent_bytes = sum(
             len(c) * 4 if hasattr(c, '__len__') else 0
@@ -463,7 +475,10 @@ class GPUSearcher:
             (indices, scores): both (n_queries, k) numpy arrays.
         """
         ops = self.ops
-        Q = ops.to_device(np.asarray(queries, dtype=np.float32))
+        queries = np.asarray(queries, dtype=np.float32)
+        if queries.ndim == 1:
+            queries = queries[np.newaxis]
+        Q = ops.to_device(queries)
         Q_rot = ops.matmul(Q, self._R.T if hasattr(self._R, 'T') else ops.xp.transpose(self._R))
 
         if self._x_hat_rot_gpu is None:
@@ -497,17 +512,22 @@ class GPUSearcher:
     # ------------------------------------------------------------------
 
     def _device_norms(self, precision):
-        """Device copy of the quantizer's effective norms at ``precision``.
+        """Device copies of the search scale and the centred row bias.
 
-        ``None`` in scalar mode. Cached, because the host side walks the
+        ``(scale, bias)`` from ``Quantizer._score_norms`` and
+        ``Quantizer._row_bias``; bias is ``None`` for uncentred codes and
+        both are ``None`` in scalar mode. Cached, because the host side walks the
         codes once per precision to get the decoded direction's length.
         """
         if self._compressed.norms is None:
-            return None
+            return None, None
         if precision not in self._norm_cache:
-            host = self._pq._effective_norms(self._compressed, precision)
-            self._norm_cache[precision] = self.ops.to_device(
-                np.asarray(host, dtype=np.float32)
+            host = self._pq._score_norms(self._compressed, precision)
+            bias = self._pq._row_bias(self._compressed, precision)
+            self._norm_cache[precision] = (
+                self.ops.to_device(np.asarray(host, dtype=np.float32)),
+                None if bias is None else self.ops.to_device(
+                    np.asarray(bias, dtype=np.float32)),
             )
         return self._norm_cache[precision]
 
@@ -520,17 +540,21 @@ class GPUSearcher:
         return self._pq._query_offset(query)
 
     def _scale(self, scores, rows=None, precision=None):
-        """Rescale raw quantized scores by the effective norms, if any.
+        """Turn raw quantized scores into the search estimate.
 
-        Scalar-mode codes quantize the coordinates themselves, so the
-        lookup already is the approximate inner product.
+        Multiplies by the search scale and adds the centred per-row bias
+        (``Quantizer._score_norms`` / ``_row_bias``), so GPU scores match
+        ``Quantizer.search``. Scalar-mode codes quantize the coordinates
+        themselves, so the lookup already is the approximate inner product.
         """
-        norms = self._device_norms(precision)
+        norms, bias = self._device_norms(precision)
         if norms is None:
             return scores
         if rows is not None:
             norms = norms[rows]
-        return scores * norms
+            bias = None if bias is None else bias[rows]
+        scores = scores * norms
+        return scores if bias is None else scores + bias
 
     def _build_x_hat_rot(self):
         """Dequantize indices to float32 on GPU."""

@@ -1,9 +1,10 @@
 """What a caller-declared corpus mean is worth (`Quantizer(mean=...)`).
 
-A centred code stores the offset from the mean and solves for the stored
-length so the reconstruction keeps the original vector's norm. Both halves
-are needed: subtracting a mean and keeping the residual's own length loses
-recall at every bit width, which the `--naive` column shows.
+A centred code stores the offset from the mean, ``||x - mu||`` and
+``mu . (x - mu)``. Search scores ``q.mu + mu.r + ||r|| (q-mu).u_hat / kappa``
+(remex 2.0); the ``1.x`` column ranks by ``q . decode(x)`` instead, which is
+what remex 1.x searched. The ``naive`` column subtracts the mean and keeps
+the residual's own length with no correction at all.
 
 The gain tracks how much of the corpus is a shared direction, so it is large
 on raw inner-product embeddings and small on L2-normalised ones. Measure on
@@ -53,17 +54,20 @@ def report(name, corpus, queries):
     print(f"  n={len(corpus)} d={corpus.shape[1]} queries={len(queries)}"
           f"  ||mean|| / mean ||x|| = {shared:.3f}")
     print(f"  {'bits':>4} {'R@10 plain':>10} {'centred':>8} {'delta':>7}"
-          f" | {'naive':>7} | {'R@100 plain':>11} {'centred':>8} {'delta':>7}")
+          f" | {'1.x':>7} {'naive':>7} | {'R@100 plain':>11} {'centred':>8} {'delta':>7}")
     for bits in BITS:
         plain = Quantizer(d=corpus.shape[1], bits=bits, seed=42)
         cen = Quantizer(d=corpus.shape[1], bits=bits, seed=42, mean=mu)
-        pa = exact_topk(plain.decode(plain.encode(corpus)), queries, 100)
-        pb = exact_topk(cen.decode(cen.encode(corpus)), queries, 100)
+        pa = plain.search_batch(plain.encode(corpus), queries, k=100)[0]
+        codes = cen.encode(corpus)
+        pb = cen.search_batch(codes, queries, k=100)[0]
+        # remex 1.x scored centred codes as q . decode(x); kept for comparison
+        p1 = exact_topk(cen.decode(codes), queries, 100)
         pn = exact_topk(naive_centred(corpus, mu, bits), queries, 100)
-        a10, b10, n10 = (recall_at_k(p, truth, 10) for p in (pa, pb, pn))
+        a10, b10, o10, n10 = (recall_at_k(p, truth, 10) for p in (pa, pb, p1, pn))
         a100, b100 = (recall_at_k(p, truth, 100) for p in (pa, pb))
         print(f"  {bits:>4} {a10:>10.3f} {b10:>8.3f} {b10 - a10:>+7.3f}"
-              f" | {n10:>7.3f} | {a100:>11.3f} {b100:>8.3f} {b100 - a100:>+7.3f}")
+              f" | {o10:>7.3f} {n10:>7.3f} | {a100:>11.3f} {b100:>8.3f} {b100 - a100:>+7.3f}")
 
 
 def main():

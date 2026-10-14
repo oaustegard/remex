@@ -329,6 +329,9 @@ class IVFCoarseIndex:
             Length is ``min(k, n_visited)`` where ``n_visited`` is the
             total candidate count across the visited cells.
         """
+        # guards first, so an empty cell cannot return [] for codes this
+        # quantizer cannot read
+        self.quantizer._resolve_centroids(self.compressed, precision)
         q = np.asarray(query, dtype=np.float32)
         q_rot = self.quantizer._rotate_query(q)
 
@@ -355,8 +358,10 @@ class IVFCoarseIndex:
             shift = self.quantizer.bits - precision
             cand_idx = cand_idx >> shift
 
-        norms = self.quantizer._effective_norms(self.compressed, precision)
+        norms = self.quantizer._score_norms(self.compressed, precision)
         cand_norms = None if norms is None else norms[cand]
+        bias = self.quantizer._row_bias(self.compressed, precision)
+        cand_bias = None if bias is None else bias[cand]
         offset = self.quantizer._query_offset(query)
         d = self.d
         dim_idx = np.arange(d)
@@ -370,6 +375,8 @@ class IVFCoarseIndex:
                 chunk_scores,
                 None if cand_norms is None else cand_norms[start:end],
             ) + offset
+            if cand_bias is not None:
+                scores[start:end] += cand_bias[start:end]
 
         k_eff = min(k, n_cand)
         if k_eff >= n_cand:
@@ -437,11 +444,14 @@ class IVFCoarseIndex:
             fine_indices = self.compressed.indices[coarse_idx]
         X_hat_cand = fine_centroids[fine_indices]
 
-        norms = self.quantizer._effective_norms(self.compressed, None)
+        norms = self.quantizer._score_norms(self.compressed, None)
         fine_scores = _apply_norms(
             X_hat_cand @ q_rot,
             None if norms is None else norms[coarse_idx],
         ) + self.quantizer._query_offset(query)
+        bias = self.quantizer._row_bias(self.compressed, None)
+        if bias is not None:
+            fine_scores = fine_scores + bias[coarse_idx]
         k_eff = min(k, len(coarse_idx))
         order = np.argsort(-fine_scores)[:k_eff]
         return coarse_idx[order], fine_scores[order]

@@ -21,6 +21,36 @@ def _norms_nbytes(norms: Optional[np.ndarray]) -> int:
     return 0 if norms is None else norms.nbytes
 
 
+def _as_mean_dots(mean_dots, n: int, mean) -> Optional[np.ndarray]:
+    """``mean_dots`` as a float32 vector of length ``n``, or ``None``.
+
+    Only centred containers carry one: without a ``mean`` there is nothing
+    for it to be the dot product with.
+    """
+    if mean_dots is None:
+        return None
+    if mean is None:
+        raise ValueError("mean_dots is only meaningful with a mean (centred codes)")
+    out = np.asarray(mean_dots, dtype=np.float32).reshape(-1)
+    if out.shape[0] != n:
+        raise ValueError(f"mean_dots has {out.shape[0]} rows, the codes have {n}")
+    return out
+
+
+def _as_rows(idx, n: int) -> np.ndarray:
+    """Row selector for ``subset``: a boolean mask of length ``n`` becomes its
+    row numbers, and an empty selection is an empty integer array."""
+    idx = np.asarray(idx)
+    if idx.dtype == bool:
+        if idx.shape != (n,):
+            raise IndexError(
+                f"boolean mask has shape {idx.shape}, the container has {n} rows")
+        return np.flatnonzero(idx)
+    if idx.size == 0:
+        return np.empty(0, dtype=np.intp)
+    return idx
+
+
 def _validate_mean(mean, d: int, normalize: bool, renorm: bool):
     """Check a caller-declared corpus mean, or pass ``None`` through.
 
@@ -134,6 +164,16 @@ def _apply_norms(
     return scores if norms is None else scores * norms
 
 
+def _add_bias(
+    scores: np.ndarray, bias: Optional[np.ndarray],
+    rows: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Add the centred per-row offset (``Quantizer._row_bias``), if any."""
+    if bias is None:
+        return scores
+    return scores + (bias if rows is None else bias[rows])
+
+
 class CompressedVectors:
     """Container for quantized vector data.
 
@@ -147,12 +187,13 @@ class CompressedVectors:
     """
 
     __slots__ = ("indices", "norms", "d", "bits", "n", "rotation", "mean",
-                 "_x_hat_rot", "_dir_len")
+                 "mean_dots", "_x_hat_rot", "_dir_len")
 
     def __init__(self, indices: np.ndarray, norms: Optional[np.ndarray],
                  d: int, bits: int,
                  rotation: str = LEGACY_ROTATION,
-                 mean: Optional[np.ndarray] = None):
+                 mean: Optional[np.ndarray] = None,
+                 mean_dots: Optional[np.ndarray] = None):
         self.indices = indices  # (n, d) uint8 — unpacked for fast access
         self.norms = norms
         self.d = d
@@ -163,8 +204,12 @@ class CompressedVectors:
         #: Part of the encoding the way ``rotation`` is: decoding against a
         #: different one is refused rather than silently wrong.
         self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
+        #: Centred codes only: ``mu . (x - mu)`` per row, exact. With ``norms``
+        #: holding ``||x - mu||`` it gives the search its row offset and
+        #: ``decode`` the original length. See ``Quantizer`` design notes.
+        self.mean_dots = _as_mean_dots(mean_dots, self.n, self.mean)
         self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
-        self._dir_len = {}  # precision -> (n,) decoded-direction length; ("centred", p) -> re-solved m
+        self._dir_len = {}  # precision -> (n,) decoded-direction length; ("bias"|"mean_coef", p) -> centred per-row terms
 
     @property
     def has_norms(self) -> bool:
@@ -173,10 +218,12 @@ class CompressedVectors:
 
     def subset(self, idx: np.ndarray) -> "CompressedVectors":
         """Return a CompressedVectors containing only the given row indices."""
+        idx = _as_rows(idx, self.n)
         sub = CompressedVectors(
             self.indices[idx],
             None if self.norms is None else self.norms[idx],
             self.d, self.bits, self.rotation, self.mean,
+            None if self.mean_dots is None else self.mean_dots[idx],
         )
         if self._x_hat_rot is not None:
             sub._x_hat_rot = self._x_hat_rot[idx]
@@ -185,12 +232,14 @@ class CompressedVectors:
     @property
     def nbytes(self) -> int:
         """Packed memory footprint in bytes (honest compression)."""
-        return packed_nbytes(self.n, self.d, self.bits) + _norms_nbytes(self.norms)
+        return (packed_nbytes(self.n, self.d, self.bits)
+                + _norms_nbytes(self.norms) + _norms_nbytes(self.mean_dots))
 
     @property
     def nbytes_unpacked(self) -> int:
         """Unpacked memory footprint (what's actually in RAM)."""
-        return self.indices.nbytes + _norms_nbytes(self.norms)
+        return (self.indices.nbytes + _norms_nbytes(self.norms)
+                + _norms_nbytes(self.mean_dots))
 
     @property
     def compression_ratio(self) -> float:
@@ -200,7 +249,8 @@ class CompressedVectors:
     @property
     def resident_bytes(self) -> int:
         """Actual RAM footprint including any active caches."""
-        total = self.indices.nbytes + _norms_nbytes(self.norms)
+        total = (self.indices.nbytes + _norms_nbytes(self.norms)
+                 + _norms_nbytes(self.mean_dots))
         if self._x_hat_rot is not None:
             total += self._x_hat_rot.nbytes
         return total
@@ -235,6 +285,8 @@ class CompressedVectors:
             fields["norms"] = self.norms
         if self.mean is not None:
             fields["mean"] = self.mean
+        if self.mean_dots is not None:
+            fields["mean_dots"] = self.mean_dots
         return fields
 
     @classmethod
@@ -262,7 +314,8 @@ class CompressedVectors:
 
         norms = data["norms"] if "norms" in data else None
         mean = data["mean"] if "mean" in data else None
-        return cls(indices, norms, d, bits, rotation, mean)
+        mean_dots = data["mean_dots"] if "mean_dots" in data else None
+        return cls(indices, norms, d, bits, rotation, mean, mean_dots)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format, packing indices for storage.
@@ -307,7 +360,7 @@ class PackedVectors:
     """
 
     __slots__ = ("_packed", "norms", "d", "bits", "n", "rotation", "mean",
-                 "_row_bytes", "_row_aligned", "_dir_len")
+                 "mean_dots", "_row_bytes", "_row_aligned", "_dir_len")
 
     def __init__(
         self,
@@ -318,6 +371,7 @@ class PackedVectors:
         bits: int,
         rotation: str = LEGACY_ROTATION,
         mean: Optional[np.ndarray] = None,
+        mean_dots: Optional[np.ndarray] = None,
     ):
         """
         Args:
@@ -337,9 +391,10 @@ class PackedVectors:
         self.bits = bits
         self.rotation = validate_rotation(rotation)
         self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
+        self.mean_dots = _as_mean_dots(mean_dots, n, self.mean)
         self._row_bytes = packed_nbytes(1, d, bits)
         self._row_aligned = (d * bits) % 8 == 0
-        self._dir_len = {}  # precision -> (n,) decoded-direction length; ("centred", p) -> re-solved m
+        self._dir_len = {}  # precision -> (n,) decoded-direction length; ("bias"|"mean_coef", p) -> centred per-row terms
 
     @property
     def has_norms(self) -> bool:
@@ -410,7 +465,10 @@ class PackedVectors:
                 packed[i] = pack(compressed.indices[i], bits)
         norms = None if compressed.norms is None else compressed.norms.copy()
         mean = None if compressed.mean is None else compressed.mean.copy()
-        return cls(packed, norms, n, d, bits, compressed.rotation, mean)
+        mean_dots = (None if compressed.mean_dots is None
+                     else compressed.mean_dots.copy())
+        return cls(packed, norms, n, d, bits, compressed.rotation, mean,
+                   mean_dots)
 
     @classmethod
     def from_rows(
@@ -420,6 +478,8 @@ class PackedVectors:
         d: int,
         bits: int,
         rotation: str = LEGACY_ROTATION,
+        mean: Optional[np.ndarray] = None,
+        mean_dots: Optional[np.ndarray] = None,
     ) -> "PackedVectors":
         """Reconstruct from database packed byte rows.
 
@@ -433,6 +493,8 @@ class PackedVectors:
                 schema has no column for it, so the caller must supply it
                 for anything other than Haar — this default is the frozen
                 historical value, not the library default.
+            mean: Corpus mean, for centred codes (``Quantizer(mean=...)``).
+            mean_dots: (n,) ``mu . (x - mu)`` per row, required with ``mean``.
 
         Returns:
             PackedVectors instance.
@@ -447,7 +509,9 @@ class PackedVectors:
         n = len(row_list)
         if norms is not None:
             norms = np.asarray(norms, dtype=np.float32)
-        return cls(packed, norms, n, d, bits, rotation)
+        if mean is not None and mean_dots is None:
+            raise ValueError("centred rows need mean_dots alongside mean")
+        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots)
 
     def at_precision(self, target_bits: int) -> "PackedVectors":
         """Derive a lower-bit representation via Matryoshka right-shift.
@@ -489,6 +553,7 @@ class PackedVectors:
         return PackedVectors(
             packed_target, self._copy_norms(), self.n, self.d, target_bits,
             self.rotation, None if self.mean is None else self.mean.copy(),
+            self._copy_mean_dots(),
         )
 
     def to_compressed(self) -> CompressedVectors:
@@ -497,11 +562,12 @@ class PackedVectors:
         return CompressedVectors(
             indices, self._copy_norms(), self.d, self.bits, self.rotation,
             None if self.mean is None else self.mean.copy(),
+            self._copy_mean_dots(),
         )
 
     def subset(self, idx: np.ndarray) -> "PackedVectors":
         """Return a PackedVectors containing only the given row indices."""
-        idx = np.asarray(idx)
+        idx = _as_rows(idx, self.n)
         return PackedVectors(
             self._packed[idx].copy(),
             None if self.norms is None else self.norms[idx].copy(),
@@ -510,20 +576,25 @@ class PackedVectors:
             self.bits,
             self.rotation,
             None if self.mean is None else self.mean.copy(),
+            None if self.mean_dots is None else self.mean_dots[idx].copy(),
         )
 
     def _copy_norms(self) -> Optional[np.ndarray]:
         return None if self.norms is None else self.norms.copy()
 
+    def _copy_mean_dots(self) -> Optional[np.ndarray]:
+        return None if self.mean_dots is None else self.mean_dots.copy()
+
     @property
     def nbytes(self) -> int:
         """Packed memory footprint in bytes."""
-        return self._packed.nbytes + _norms_nbytes(self.norms)
+        return (self._packed.nbytes + _norms_nbytes(self.norms)
+                + _norms_nbytes(self.mean_dots))
 
     @property
     def resident_bytes(self) -> int:
         """Actual RAM footprint (same as nbytes — no caches)."""
-        return self._packed.nbytes + _norms_nbytes(self.norms)
+        return self.nbytes
 
     @property
     def compression_ratio(self) -> float:
@@ -539,6 +610,8 @@ class PackedVectors:
         optional = {} if self.norms is None else {"norms": self.norms}
         if self.mean is not None:
             optional["mean"] = self.mean
+        if self.mean_dots is not None:
+            optional["mean_dots"] = self.mean_dots
         np.savez_compressed(
             path,
             packed_indices=self._packed.ravel(),
@@ -566,7 +639,8 @@ class PackedVectors:
         packed = packed_flat.reshape(n, row_bytes)
         norms = data["norms"] if "norms" in data else None
         mean = data["mean"] if "mean" in data else None
-        return cls(packed, norms, n, d, bits, rotation, mean)
+        mean_dots = data["mean_dots"] if "mean_dots" in data else None
+        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format.
@@ -613,7 +687,14 @@ class PackedVectors:
         }
         if self.norms is not None:
             fields.insert(0, pa.field("norms", pa.float32()))
-            columns["norms"] = pa.array(self.norms.tolist(), type=pa.float32())
+            columns["norms"] = pa.array(self.norms, type=pa.float32())
+        if self.mean is not None:
+            # The mean is d floats, not a per-row value, so it rides in the
+            # schema metadata as raw little-endian float32 bytes.
+            metadata[b"mean"] = self.mean.astype("<f4").tobytes()
+        if self.mean_dots is not None:
+            fields.append(pa.field("mean_dots", pa.float32()))
+            columns["mean_dots"] = pa.array(self.mean_dots, type=pa.float32())
 
         schema = pa.schema(fields, metadata=metadata)
         table = pa.table(
@@ -656,16 +737,27 @@ class PackedVectors:
             norms = table.column("norms").to_numpy().astype(np.float32)
         else:
             norms = None  # scalar mode — the column was never written
+        mean = (
+            np.frombuffer(metadata[b"mean"], dtype="<f4").astype(np.float32)
+            if b"mean" in metadata else None
+        )
+        mean_dots = (
+            table.column("mean_dots").to_numpy().astype(np.float32)
+            if "mean_dots" in table.schema.names else None
+        )
 
         # Extract packed data from contiguous Arrow buffer
-        packed_col = table.column("packed_indices")
-        chunk = packed_col.chunk(0)
-        buffers = chunk.buffers()
-        data_buf = buffers[1]
-        packed_flat = np.frombuffer(data_buf, dtype=np.uint8)[: n * row_bytes]
-        packed = packed_flat.reshape(n, row_bytes).copy()
+        packed_col = table.column("packed_indices").combine_chunks()
+        if n == 0:
+            packed = np.empty((0, row_bytes), dtype=np.uint8)
+        else:
+            data_buf = packed_col.buffers()[1]
+            offset = packed_col.offset * row_bytes
+            packed_flat = np.frombuffer(data_buf, dtype=np.uint8)[
+                offset: offset + n * row_bytes]
+            packed = packed_flat.reshape(n, row_bytes).copy()
 
-        return cls(packed, norms, n, d, bits, rotation)
+        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots)
 
 
 #: Row blocks in ``encode`` are sized to about this many input floats. Only
@@ -851,11 +943,14 @@ class Quantizer:
         if not self.normalize:
             return self._encode_scalar(X)
 
-        X = np.asarray(X, dtype=np.float32)
-        if X.ndim == 1:
-            X = X[np.newaxis]
+        X_in = np.asarray(X)
+        if X_in.ndim == 1:
+            X_in = X_in[np.newaxis]
+        X = np.asarray(X_in, dtype=np.float32)
         if X.shape[1] != self.d:
             raise ValueError(f"Expected d={self.d}, got {X.shape[1]}")
+        if self.mean is not None:
+            mean64 = self.mean.astype(np.float64)
 
         # Encode in row blocks. Every step below is per row or per
         # coordinate, so the codes do not depend on the block size; what it
@@ -866,6 +961,7 @@ class Quantizer:
         indices = np.empty((n, self.d), np.uint8)
         norms = np.empty(n, np.float32)
         lengths_out = None if self.mean is None else np.empty(n, np.float32)
+        dots_out = None if self.mean is None else np.empty(n, np.float32)
         # Anisotropy check for an uncentered low-bit encode. It reads the
         # norms computed below plus a column sum, and only ever warns: the
         # codes are the same whether or not it runs.
@@ -886,21 +982,22 @@ class Quantizer:
                 colsum += blk.sum(axis=0, dtype=np.float64)
                 norm_total += float(norms64.sum())
 
-            target = blk if self.mean is None else blk - self.mean
             if self.mean is None:
+                target = blk
                 lengths = norms[lo:hi]
             else:
-                lengths = np.sqrt(
-                    np.sum(target.astype(np.float64) ** 2, axis=1)
-                ).astype(np.float32)
+                # The residual in float64 from the caller's own values: with
+                # a large mean, a float32 cast first loses r to rounding.
+                target64 = X_in[lo:hi].astype(np.float64) - mean64
+                lengths = np.sqrt(np.sum(target64 ** 2, axis=1)).astype(np.float32)
+                dots_out[lo:hi] = (target64 @ mean64).astype(np.float32)
+                target = target64.astype(np.float32)
 
             X_unit = target / np.maximum(lengths, 1e-8)[:, None]
             X_rot = self._rotate_rows(X_unit)
             indices[lo:hi] = assign_codes(X_rot, self.boundaries, self.bits)
             if self.mean is not None:
-                lengths_out[lo:hi] = self._centred_lengths(
-                    indices[lo:hi], norms64, lengths
-                )
+                lengths_out[lo:hi] = lengths
 
         if judge and norm_total > 0.0:
             _warn_if_anisotropic(
@@ -913,34 +1010,8 @@ class Quantizer:
             )
         return CompressedVectors(
             indices, lengths_out, self.d, self.bits, self.rotation, self.mean,
+            dots_out,
         )
-
-    def _centred_lengths(self, indices, norms64, fallback):
-        """How far along the decoded direction to land so the reconstruction
-        has the original vector's length.
-
-        A centred code decodes to ``mu + m * u_hat``. Choosing ``m`` to solve
-        ``||mu + m*u_hat|| == ||x||`` puts the whole correction in the norms
-        column the container already has, so a centred index costs no extra
-        bytes per vector. Expanding the norm gives
-        ``m^2 + 2m(mu.u_hat) + (||mu||^2 - ||x||^2) = 0``; the positive root
-        is the one on the ray the code points along.
-
-        Where no positive root exists — the original vector is shorter than
-        the mean's distance to that ray, which needs a corpus whose mean
-        dwarfs its spread — the residual's own length is kept instead, which
-        is what an uncentred code would have stored.
-        """
-        u_rot = self.centroids[indices]
-        u = self._unrotate_rows(u_rot).astype(np.float64)
-        u /= np.maximum(np.linalg.norm(u, axis=1), 1e-12)[:, None]
-
-        mu = self.mean.astype(np.float64)
-        b = u @ mu
-        c = float(mu @ mu) - norms64 ** 2
-        disc = b * b - c
-        m = np.where(disc > 0.0, -b + np.sqrt(np.maximum(disc, 0.0)), fallback)
-        return m.astype(np.float32)
 
     def _encode_scalar(self, X: np.ndarray) -> CompressedVectors:
         """Quantize coordinates directly — no normalization, no norms.
@@ -1037,6 +1108,22 @@ class Quantizer:
             )
         self._check_mode(compressed)
 
+    def _check_bits(self, compressed) -> None:
+        """Refuse codes written at a different bit width.
+
+        The code values index a ``2**bits`` table, so a reader with a
+        different width maps them onto the wrong centroids and returns
+        plausible scores. A lower Matryoshka level is read with
+        ``precision=``, from the quantizer that wrote the codes.
+        """
+        bits = getattr(compressed, "bits", self.bits)
+        if bits != self.bits:
+            raise ValueError(
+                f"bits mismatch: these codes are {bits}-bit but this "
+                f"Quantizer is {self.bits}-bit. Read them with the quantizer "
+                f"that wrote them (use precision= for a lower level)."
+            )
+
     def _check_mean(self, compressed) -> None:
         """Refuse to interpret codes written against a different centre.
 
@@ -1055,6 +1142,16 @@ class Quantizer:
                 f"mean mismatch: these codes were encoded with {which} but "
                 f"this Quantizer uses {want}. Rebuild the Quantizer with the "
                 f"mean that wrote them."
+                + (" If they are centred codes saved to Arrow by remex < 2.0, "
+                   "which did not store the mean, re-encode the corpus."
+                   if stored is None else "")
+            )
+        if getattr(compressed, "mean_dots", None) is None:
+            raise ValueError(
+                "these centred codes have no mean_dots column: they were "
+                "written by remex < 2.0, whose centred format stored a "
+                "different per-row length. Re-encode the corpus with this "
+                "version (codes are unchanged, only the per-row floats differ)."
             )
         if not np.allclose(stored, self.mean, rtol=1e-5, atol=1e-6):
             raise ValueError(
@@ -1145,20 +1242,166 @@ class Quantizer:
     def _effective_norms(
         self, compressed, precision: Optional[int] = None
     ) -> Optional[np.ndarray]:
-        """The scale to multiply a decoded direction by.
+        """The scale ``decode`` multiplies a raw decoded direction by.
 
         ``norms`` on its own reconstructs a vector of the wrong length;
         dividing by the decoded direction's length fixes it. Returns
         ``norms`` unchanged in scalar mode (no norms to correct) and under
-        ``renorm=False``.
+        ``renorm=False``. For centred codes it is ``kappa * ||r|| / ||v||``:
+        the expected projection of ``r`` on ``u_hat`` is ``kappa * ||r||``,
+        which reconstructs ``r`` with less squared error than ``||r||``
+        does. ``decode`` adds a component along the mean on top
+        (``_decode_mean_coef``).
         """
         if compressed.norms is None or not self.renorm:
             return compressed.norms
+        # Cached per-row arrays would otherwise skip _resolve_centroids'
+        # guards on the second search; the check is d floats.
+        self._check_rotation(compressed)
+        self._check_bits(compressed)
+        self._check_mean(compressed)
         lengths = self._direction_lengths(compressed, precision)
         norms = compressed.norms
-        if self.mean is not None and precision is not None and precision != self.bits:
-            norms = self._centred_lengths_at(compressed, precision)
+        if self.mean is not None:
+            norms = norms * np.float32(self._cosine_factor(precision))
         return norms / np.maximum(lengths, 1e-12)
+
+    def _decode_mean_coef(
+        self, compressed, precision: Optional[int] = None
+    ) -> np.ndarray:
+        """Per-row weight on ``mu`` in a centred ``decode``.
+
+        ``decode`` returns ``mu * w + kappa ||r|| u_hat`` with ``w`` chosen
+        so that ``mu . (decode(x) - mu)`` equals the stored ``mu . r``
+        exactly. Against the 1.x decode, which solved for ``m`` so that
+        ``||decode(x)|| == ||x||``, this lowers reconstruction MSE on every
+        corpus measured (SPECTER2 1-bit 29.1 -> 26.0, a shift-10 synthetic
+        2-bit 14.7 -> 7.2) and has no quadratic whose root can land on the
+        far side of the mean. Cached under ``("mean_coef", precision)``.
+        """
+        key = ("mean_coef", precision)
+        cached = compressed._dir_len.get(key)
+        if cached is not None:
+            return cached
+        mu = self.mean.astype(np.float64)
+        mu_sq = float(mu @ mu)
+        n = compressed.n
+        if mu_sq <= 1e-30:
+            out = np.ones(n, np.float32)
+        else:
+            mu_rot = self._rotate_rows(
+                self.mean[np.newaxis].astype(np.float32))[0].astype(np.float64)
+            scale = self._effective_norms(compressed, precision).astype(np.float64)
+            along = self._direction_mean_dots(compressed, precision, mu_rot)
+            out = (1.0 + (compressed.mean_dots.astype(np.float64)
+                          - scale * along) / mu_sq).astype(np.float32)
+        compressed._dir_len[key] = out
+        return out
+
+    def _score_norms(
+        self, compressed, precision: Optional[int] = None
+    ) -> Optional[np.ndarray]:
+        """The scale every search path multiplies ``q_rot . v`` by.
+
+        The same as ``_effective_norms`` except for centred codes, where
+        search does not score ``q . decode(x)``. It scores
+
+            q . mu  +  mu . r  +  ||r|| * (q - mu) . u_hat / kappa
+
+        with ``r = x - mu`` and ``u_hat`` the unit decoded direction.
+        ``mu . r`` is stored exactly (``mean_dots``), so the only quantised
+        term is multiplied by ``||q - mu||`` instead of ``||q||`` -- on
+        SPECTER2 that is 8.4 against 21.7. ``kappa`` (``_cosine_factor``)
+        is the expected cosine between ``u_hat`` and the true direction, so
+        the estimate is not shrunk by it. This is the estimator faiss's
+        RaBitQ uses; on SPECTER2 it raised centred 1-bit recall@10 from
+        0.689 to 0.812. Expanding ``(q - mu) . v`` puts it in the form the
+        search kernels already compute: ``(q_rot . v) * scale + bias``, the
+        scale returned here and the bias from ``_row_bias``.
+        """
+        if self.mean is None or compressed.norms is None:
+            return self._effective_norms(compressed, precision)
+        self._check_rotation(compressed)
+        self._check_bits(compressed)
+        self._check_mean(compressed)
+        lengths = self._direction_lengths(compressed, precision)
+        return compressed.norms / (
+            np.maximum(lengths, 1e-12) * self._cosine_factor(precision)
+        )
+
+    def _row_bias(
+        self, compressed, precision: Optional[int] = None
+    ) -> Optional[np.ndarray]:
+        """Per-row score offset for centred codes, ``None`` otherwise.
+
+        ``mu . r - scale * (v . R mu)``: the exact ``mu . r`` minus what the
+        scaled direction alone would have contributed along the mean, so
+        that ``(q_rot . v) * scale + bias + q . mu`` is the estimator in
+        ``_score_norms``. Cached per precision on the container.
+        """
+        if self.mean is None or compressed.norms is None:
+            return None
+        key = ("bias", precision)
+        cached = compressed._dir_len.get(key)
+        if cached is not None:
+            return cached
+        mu_rot = self._rotate_rows(
+            self.mean[np.newaxis].astype(np.float32))[0].astype(np.float64)
+        scale = self._score_norms(compressed, precision).astype(np.float64)
+        along = self._direction_mean_dots(compressed, precision, mu_rot)
+        out = (compressed.mean_dots.astype(np.float64) - scale * along
+               ).astype(np.float32)
+        compressed._dir_len[key] = out
+        return out
+
+    def _cosine_factor(self, precision: Optional[int] = None) -> float:
+        """The cosine factor between a unit vector and its decoded direction.
+
+        ``E[u . v] / sqrt(E[||v||^2])``, a moment ratio that approximates the
+        mean cosine ``E[u.v / ||v||]`` (within 0.001 from d=64 up, 0.04 at
+        d=3 for a nested level), with ``v`` the decoded (unrotated
+        is irrelevant: R is orthogonal) direction of a uniformly random unit
+        vector ``u``. A rotated unit coordinate ``z`` has ``z^2 ~
+        Beta(1/2, (d-1)/2)``, so both moments are closed-form per cell:
+        ``P(cell)`` from that Beta, ``E[z 1{cell}]`` from ``Beta(1, (d-1)/2)``.
+        Data-oblivious. Each full-width cell maps to its nested centroid at
+        ``precision``. At d=768 it is 0.798 / 0.940 / 0.983 / 0.995 for 1-4
+        bits and 0.916 for 2-bit read from 8-bit codes; at small d the
+        cosine is higher (0.900 at d=2, 1 bit), which a Gaussian
+        approximation of ``z`` misses.
+        """
+        cache = self.__dict__.setdefault("_kappa", {})
+        if precision in cache:
+            return cache[precision]
+        d = self.d
+        if d == 1:
+            # a unit "vector" is +-1 and every code keeps its sign
+            cache[precision] = 1.0
+            return 1.0
+        from scipy.special import betaln
+        from scipy.stats import beta as _beta
+        b = (d - 1) / 2.0
+        edges = np.concatenate(([-1.0], np.clip(
+            self.boundaries.astype(np.float64), -1.0, 1.0), [1.0]))
+
+        def cdf(t):            # P(z <= t)
+            return 0.5 + 0.5 * np.sign(t) * _beta.cdf(t * t, 0.5, b)
+
+        def first(t):          # E[z 1{z <= t}], even in t
+            k = np.exp(betaln(1.0, b) - betaln(0.5, b))
+            return -0.5 * k * (1.0 - _beta.cdf(t * t, 1.0, b))
+
+        prob = np.diff(cdf(edges))
+        mz = np.diff(first(edges))
+        if precision is None or precision == self.bits:
+            cent = self.centroids.astype(np.float64)
+        else:
+            shift = self.bits - precision
+            cent = self._nested[precision].astype(np.float64)[
+                np.arange(len(prob)) >> shift]
+        kappa = float(d * np.sum(cent * mz) / np.sqrt(d * np.sum(prob * cent * cent)))
+        cache[precision] = kappa
+        return kappa
 
     def _direction_mean_dots(
         self, compressed, precision: Optional[int], mu_rot: np.ndarray
@@ -1184,45 +1427,6 @@ class Quantizer:
             out[start:end] = centroids[chunk] @ mu_rot
         return out
 
-    def _centred_lengths_at(self, compressed, precision: int) -> np.ndarray:
-        """The stored centred length, re-solved for a lower precision.
-
-        ``_centred_lengths`` solves ``||mu + m*u_hat|| == ||x||`` for the
-        full-precision direction. A Matryoshka level decodes a different
-        direction, and the same ``m`` then reconstructs a vector of the wrong
-        length -- with a dominant mean the solve is steep in ``mu . u_hat``, so
-        a 1-bit read of an 8-bit code lost 0.24 nDCG@10 on
-        pplx-embed-v2-late tokens against a direct 1-bit encode.
-
-        ``||x||`` is recoverable from the full-precision code, so ``m`` is
-        re-solved per level with the same quadratic and the same fallback
-        (keep the stored length where no positive root exists). Nothing is
-        stored. Cached on the container under ``("centred", precision)``.
-        """
-        key = ("centred", precision)
-        cached = compressed._dir_len.get(key)
-        if cached is not None:
-            return cached
-
-        mu = self.mean.astype(np.float64)
-        mu_rot = self._rotate_rows(self.mean[np.newaxis].astype(np.float32))[0]
-        mu_rot = mu_rot.astype(np.float64)
-        m = compressed.norms.astype(np.float64)
-        mu_sq = float(mu @ mu)
-
-        len_full = np.maximum(self._direction_lengths(compressed, None), 1e-12)
-        b_full = self._direction_mean_dots(compressed, None, mu_rot) / len_full
-        x_sq = mu_sq + 2.0 * m * b_full + m * m      # ||decode(x)||^2
-
-        len_p = np.maximum(self._direction_lengths(compressed, precision), 1e-12)
-        b_p = self._direction_mean_dots(compressed, precision, mu_rot) / len_p
-        disc = b_p * b_p - (mu_sq - x_sq)
-        m_p = np.where(disc > 0.0, -b_p + np.sqrt(np.maximum(disc, 0.0)), m)
-
-        out = m_p.astype(np.float32)
-        compressed._dir_len[key] = out
-        return out
-
     def decode(
         self, compressed: CompressedVectors, precision: Optional[int] = None
     ) -> np.ndarray:
@@ -1246,8 +1450,32 @@ class Quantizer:
             return X_hat
         X_hat = X_hat * self._effective_norms(compressed, precision)[:, None]
         if self.mean is not None:
-            X_hat = X_hat + self.mean
+            X_hat = X_hat + self._decode_mean_coef(
+                compressed, precision)[:, None] * self.mean
         return X_hat
+
+    def _score_vectors(
+        self, compressed, precision: Optional[int] = None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """``(Y, bias)`` with ``q @ Y.T + bias`` equal to the search scores.
+
+        For callers that score with their own reduction (MaxSim over
+        tokens in ``remex.st``) and need the same estimate the search paths
+        give. Uncentred and scalar codes return ``(decode(...), None)``;
+        centred codes return ``mu + unrotate(scale * v)`` and the row bias.
+        """
+        if self.mean is None or compressed.norms is None:
+            return self.decode(compressed, precision), None
+        centroids = self._resolve_centroids(compressed, precision)
+        if isinstance(compressed, PackedVectors):
+            indices = compressed.unpack_rows(0, compressed.n)
+            if precision is not None and precision != self.bits:
+                indices = indices >> (self.bits - precision)
+        else:
+            indices = self._resolve_indices(compressed, precision)
+        Y = self._unrotate_rows(centroids[indices])
+        Y = Y * self._score_norms(compressed, precision)[:, None] + self.mean
+        return Y.astype(np.float32), self._row_bias(compressed, precision)
 
     def search(
         self,
@@ -1289,9 +1517,9 @@ class Quantizer:
         q_rot = self._rotate_query(query)
 
         X_hat_rot = self._get_x_hat_rot(compressed, precision)
-        scores = _apply_norms(
-            X_hat_rot @ q_rot, self._effective_norms(compressed, precision)
-        ) + self._query_offset(query)
+        scores = _add_bias(_apply_norms(
+            X_hat_rot @ q_rot, self._score_norms(compressed, precision)
+        ), self._row_bias(compressed, precision)) + self._query_offset(query)
 
         if k >= compressed.n:
             topk_idx = np.argsort(-scores)
@@ -1342,15 +1570,16 @@ class Quantizer:
             shift = 0 if (precision is None or precision == self.bits) else (self.bits - precision)
             scores = self._adc_score_packed(
                 table, compressed, shift, chunk_size,
-                self._effective_norms(compressed, precision),
+                self._score_norms(compressed, precision),
             )
         else:
             indices = self._resolve_indices(compressed, precision)
             scores = self._adc_score_chunked(
                 table, indices,
-                self._effective_norms(compressed, precision), chunk_size
+                self._score_norms(compressed, precision), chunk_size
             )
 
+        scores = _add_bias(scores, self._row_bias(compressed, precision))
         scores = scores + self._query_offset(query)
 
         if k >= compressed.n:
@@ -1416,15 +1645,17 @@ class Quantizer:
             coarse_shift = self.bits - coarse_precision
             coarse_scores = self._adc_score_packed(
                 coarse_table, compressed, coarse_shift, coarse_chunk_size,
-                self._effective_norms(compressed, coarse_precision),
+                self._score_norms(compressed, coarse_precision),
             )
         else:
             coarse_indices = self._resolve_indices(compressed, coarse_precision)
             coarse_scores = self._adc_score_chunked(
                 coarse_table, coarse_indices,
-                self._effective_norms(compressed, coarse_precision),
+                self._score_norms(compressed, coarse_precision),
                 coarse_chunk_size
             )
+        coarse_scores = _add_bias(
+            coarse_scores, self._row_bias(compressed, coarse_precision))
 
         if coarse_k >= compressed.n:
             coarse_idx = np.argsort(-coarse_scores)
@@ -1440,9 +1671,12 @@ class Quantizer:
 
         X_hat_cand = fine_centroids[fine_indices]  # (candidates, d)
 
-        fine_norms = self._effective_norms(compressed, None)
+        fine_norms = self._score_norms(compressed, None)
         cand_norms = None if fine_norms is None else fine_norms[coarse_idx]
-        fine_scores = _apply_norms(X_hat_cand @ q_rot, cand_norms) + self._query_offset(query)
+        fine_scores = _add_bias(
+            _apply_norms(X_hat_cand @ q_rot, cand_norms),
+            self._row_bias(compressed, None), coarse_idx,
+        ) + self._query_offset(query)
         rerank_order = np.argsort(-fine_scores)[:k]
 
         original_idx = coarse_idx[rerank_order]
@@ -1481,6 +1715,10 @@ class Quantizer:
                 "Use search_adc() or search_twostage(), or convert "
                 "with packed.to_compressed() first."
             )
+        self._check_rotation(compressed)
+        self._check_mode(compressed)
+        self._check_bits(compressed)
+        self._check_mean(compressed)
         queries = np.asarray(queries, dtype=np.float32)
         if queries.ndim == 1:
             queries = queries[np.newaxis]
@@ -1490,9 +1728,12 @@ class Quantizer:
 
         X_hat_rot = self._get_x_hat_rot(compressed, precision)
         # (n_queries, n) = (n_queries, d) @ (d, n)
-        eff = self._effective_norms(compressed, precision)
+        eff = self._score_norms(compressed, precision)
         batch_norms = None if eff is None else eff[np.newaxis, :]
         all_scores = _apply_norms(Q_rot @ X_hat_rot.T, batch_norms)
+        bias = self._row_bias(compressed, precision)
+        if bias is not None:
+            all_scores = all_scores + bias[np.newaxis, :]
         if self.mean is not None:
             all_scores = all_scores + (
                 np.asarray(queries, dtype=np.float32) @ self.mean
@@ -1634,6 +1875,7 @@ class Quantizer:
         one place the rotation invariant has to hold.
         """
         self._check_rotation(compressed)
+        self._check_bits(compressed)
         self._check_mean(compressed)
         if precision is None:
             return self.centroids

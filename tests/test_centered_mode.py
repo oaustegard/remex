@@ -4,11 +4,14 @@ remex stays training-free by never measuring the mean itself. The caller
 declares it, exactly as it declares ``scale`` in scalar mode, and
 ``remex.corpus_mean`` is the blessed way to compute one.
 
-The reconstruction is ``mu + m * u_hat`` with ``m`` solved at encode time so
-the reconstruction's length equals the original vector's. That keeps the
-correction in the norms column the container already has, so no per-vector
-byte is added. Subtracting a mean WITHOUT restoring the full length loses
-recall at every bit width measured, which is why the two are one feature.
+Each row stores ``||x - mu||`` in ``norms`` and ``mu . (x - mu)`` in
+``mean_dots`` (one float32, 4 B per vector). ``decode`` returns
+``w mu + kappa ||r|| u_hat`` with ``w`` making ``mu . (decode(x) - mu)`` exact.
+Search does not score ``q . decode(x)``: it scores
+``q . mu + mu . r + ||r|| (q - mu) . u_hat / kappa``, the estimator faiss's
+RaBitQ uses, so the quantisation error is multiplied by ``||q - mu||`` rather
+than ``||q||``. ``Quantizer._score_vectors`` returns the vectors and row bias
+that reproduce those scores; the path-agreement tests check against it.
 """
 import numpy as np
 import pytest
@@ -28,6 +31,12 @@ def topk(M, Q, k):
     return np.argsort(-(Q @ M.T), axis=1)[:, :k]
 
 
+def score_ref(pq, c, q, precision=None):
+    """The search estimate for every row, from ``_score_vectors``."""
+    Y, bias = pq._score_vectors(c, precision)
+    return Y @ q + (0.0 if bias is None else bias)
+
+
 def recall(pred, truth, k):
     return sum(len(set(a[:k].tolist()) & set(b[:k].tolist()))
                for a, b in zip(pred, truth)) / (len(pred) * k)
@@ -43,24 +52,26 @@ class TestCorpusMean:
 
 
 class TestReconstruction:
-    def test_length_is_restored(self):
-        """The whole point: ``||mu + m*u|| == ||x||``, not ``||m*u|| == ||r||``."""
+    def test_mean_component_is_exact(self):
+        """``mu . (decode(x) - mu)`` equals the stored ``mu . r``."""
         X = shifted_corpus()
-        pq = Quantizer(d=X.shape[1], bits=3, seed=42, mean=remex.corpus_mean(X))
-        recon = pq.decode(pq.encode(X))
-        assert np.allclose(np.linalg.norm(recon, axis=1),
-                           np.linalg.norm(X, axis=1), rtol=1e-3)
-
-    def test_extreme_shift_falls_back_on_a_small_minority(self):
-        """No positive root exists when the mean dwarfs the spread. Those rows
-        keep the residual's own length instead, and stay finite and positive."""
-        X = shifted_corpus(shift=3.0)
-        pq = Quantizer(d=X.shape[1], bits=3, seed=42, mean=remex.corpus_mean(X))
+        mu = remex.corpus_mean(X)
+        pq = Quantizer(d=X.shape[1], bits=3, seed=42, mean=mu)
         c = pq.encode(X)
-        assert np.all(np.isfinite(c.norms)) and np.all(c.norms > 0)
-        rel = np.abs(np.linalg.norm(pq.decode(c), axis=1)
-                     - np.linalg.norm(X, axis=1)) / np.linalg.norm(X, axis=1)
-        assert (rel > 1e-3).sum() < 0.02 * len(X)
+        got = (pq.decode(c).astype(np.float64) - mu) @ mu.astype(np.float64)
+        assert np.allclose(got, c.mean_dots, rtol=1e-3, atol=1e-2)
+
+    @pytest.mark.parametrize("shift", [0.3, 3.0, 10.0])
+    def test_reconstruction_beats_restoring_the_residual_length(self, shift):
+        """MSE no worse than ``mu + ||r|| u_hat``, at any shift, and finite."""
+        X = shifted_corpus(shift=shift)
+        pq = Quantizer(d=X.shape[1], bits=2, seed=42, mean=remex.corpus_mean(X))
+        c = pq.encode(X)
+        v = pq._unrotate_rows(pq.centroids[c.indices])
+        plain = c.mean + c.norms[:, None] * v / np.linalg.norm(v, axis=1, keepdims=True)
+        rec = pq.decode(c)
+        assert np.all(np.isfinite(rec))
+        assert np.mean((rec - X) ** 2) <= np.mean((plain - X) ** 2)
 
     def test_uncentered_reconstruction_is_unchanged(self):
         X = shifted_corpus()
@@ -92,16 +103,17 @@ class TestNestedPrecision:
     """
 
     @pytest.mark.parametrize("p", [1, 2, 3, 4, 6, 7])
-    def test_nested_decode_restores_length(self, p):
+    def test_nested_decode_keeps_the_mean_component(self, p):
         X = shifted_corpus()
-        pq = Quantizer(d=X.shape[1], bits=8, seed=42, mean=remex.corpus_mean(X))
-        recon = pq.decode(pq.encode(X), precision=p)
-        assert np.allclose(np.linalg.norm(recon, axis=1),
-                           np.linalg.norm(X, axis=1), rtol=1e-3)
+        mu = remex.corpus_mean(X)
+        pq = Quantizer(d=X.shape[1], bits=8, seed=42, mean=mu)
+        c = pq.encode(X)
+        got = (pq.decode(c, precision=p).astype(np.float64) - mu) @ mu.astype(np.float64)
+        assert np.allclose(got, c.mean_dots, rtol=1e-3, atol=1e-2)
 
     def test_nested_1bit_equals_standalone_1bit(self):
-        """The MSB of a centred 8-bit code is the centred 1-bit code, and with
-        ``m`` re-solved the two decode to the same vectors."""
+        """The MSB of a centred 8-bit code is the centred 1-bit code, and the
+        two decode to the same vectors."""
         X = shifted_corpus(seed=5)
         mu = remex.corpus_mean(X)
         q8 = Quantizer(d=X.shape[1], bits=8, seed=42, mean=mu)
@@ -126,7 +138,7 @@ class TestNestedPrecision:
         c = pq.encode(X)
         q = X[31]
         i_a, s_a = pq.search_adc(c, q, k=10, precision=p)
-        assert np.allclose(s_a, pq.decode(c, precision=p)[i_a] @ q, rtol=1e-3, atol=1e-4)
+        assert np.allclose(s_a, score_ref(pq, c, q, p)[i_a], rtol=1e-3, atol=1e-4)
         i_p, s_p = pq.search_adc(PackedVectors.from_compressed(c), q, k=10, precision=p)
         assert np.array_equal(i_a, i_p) and np.allclose(s_a, s_p, rtol=1e-4, atol=1e-5)
         i_c, s_c = pq.search(c, q, k=10, precision=p)
@@ -156,6 +168,17 @@ class TestGuards:
         c = Quantizer(d=X.shape[1], bits=4, seed=42, mean=mu).encode(X)
         with pytest.raises(ValueError, match="mean mismatch"):
             Quantizer(d=X.shape[1], bits=4, seed=42, mean=mu + 1.0).decode(c)
+
+    def test_pre_2_0_centred_container_is_refused(self):
+        from remex import CompressedVectors
+        X = shifted_corpus()
+        pq = Quantizer(d=X.shape[1], bits=4, seed=42, mean=remex.corpus_mean(X))
+        c = pq.encode(X)
+        old = CompressedVectors(c.indices, c.norms, c.d, c.bits, c.rotation, c.mean)
+        with pytest.raises(ValueError, match="remex < 2.0"):
+            pq.decode(old)
+        with pytest.raises(ValueError, match="remex < 2.0"):
+            pq.search(old, X[0], k=5)
 
     def test_mean_rejected_in_scalar_mode(self):
         with pytest.raises(ValueError, match="normalize=True"):
@@ -200,13 +223,56 @@ class TestSearchPaths:
         for row, q in zip(idx_b, X[:3]):
             assert np.array_equal(row, pq.search(c, q, k=5)[0])
 
-    def test_scores_track_the_reconstruction(self):
+    def test_scores_match_the_score_vectors(self):
         X = shifted_corpus(n=400, d=64, seed=6)
         pq = Quantizer(d=X.shape[1], bits=4, seed=42, mean=remex.corpus_mean(X))
         c = pq.encode(X)
         q = X[9]
         idx, scores = pq.search(c, q, k=10)
-        assert np.allclose(scores, pq.decode(c)[idx] @ q, rtol=1e-3, atol=1e-4)
+        assert np.allclose(scores, score_ref(pq, c, q)[idx], rtol=1e-3, atol=1e-4)
+
+    @pytest.mark.parametrize("bits", [1, 2, 4])
+    def test_scores_are_the_stated_estimator(self, bits):
+        """q.mu + mu.r + ||r|| (q-mu).u_hat / kappa, computed from scratch."""
+        X = shifted_corpus(n=300, d=64, seed=8)
+        mu = remex.corpus_mean(X)
+        pq = Quantizer(d=X.shape[1], bits=bits, seed=42, mean=mu)
+        c = pq.encode(X)
+        q = X[5] + 0.1
+        r = X.astype(np.float64) - mu
+        v = pq._unrotate_rows(pq.centroids[c.indices]).astype(np.float64)
+        u_hat = v / np.linalg.norm(v, axis=1, keepdims=True)
+        want = (q @ mu + r @ mu + np.linalg.norm(r, axis=1)
+                * (u_hat @ (q - mu)) / pq._cosine_factor(None))
+        idx, scores = pq.search(c, q, k=X.shape[0])
+        assert np.allclose(scores, want[idx], rtol=1e-4, atol=1e-3)
+
+    @pytest.mark.parametrize("bits", [1, 2])
+    def test_estimator_is_unbiased(self, bits):
+        """Mean signed error across all pairs is small against its spread.
+
+        Which of ``/ kappa`` (unbiased, RaBitQ) and ``* kappa`` (shrunk) ranks
+        better is corpus-dependent: on SPECTER2 ``/ kappa`` wins at 1 bit by
+        0.15 recall@10, on isotropic synthetic data ``* kappa`` wins by about
+        0.04. Search follows the real corpus; ``bench/centered_eval.py`` has
+        the numbers. This test pins the unbiasedness, not the ranking.
+        """
+        X = shifted_corpus(n=1500, d=96, shift=3.0, seed=3)
+        queries, corpus = X[:60], X[60:]
+        pq = Quantizer(d=96, bits=bits, seed=42, mean=remex.corpus_mean(corpus))
+        c = pq.encode(corpus)
+        err = np.stack([score_ref(pq, c, q) for q in queries]) - queries @ corpus.T
+        assert abs(err.mean()) < 0.05 * err.std()
+
+    def test_centred_search_beats_uncentred_on_a_shifted_corpus(self):
+        X = shifted_corpus(n=1500, d=96, shift=3.0, seed=3)
+        queries, corpus = X[:60], X[60:]
+        truth = topk(corpus, queries, 10)
+        got = {}
+        for mean in (None, remex.corpus_mean(corpus)):
+            pq = Quantizer(d=96, bits=1, seed=42, mean=mean)
+            got[mean is None] = recall(pq.search_batch(pq.encode(corpus), queries, k=10)[0], truth, 10)
+        assert got[False] > got[True] + 0.05
 
 
 class TestRecall:
@@ -291,3 +357,79 @@ class TestIvfAndGpuAgree:
         i_q, s_q = pq.search(c, q, k=10)
         assert np.array_equal(i_g, i_q)
         assert np.allclose(s_g, s_q, rtol=1e-4, atol=1e-4)
+
+
+class TestMeanDots:
+    def test_columns_are_exact(self):
+        X = shifted_corpus(seed=4)
+        mu = remex.corpus_mean(X)
+        c = Quantizer(d=X.shape[1], bits=2, seed=42, mean=mu).encode(X)
+        r = X.astype(np.float64) - mu
+        assert np.allclose(c.norms, np.linalg.norm(r, axis=1), rtol=1e-5)
+        assert np.allclose(c.mean_dots, r @ mu, rtol=1e-4, atol=1e-3)
+
+    def test_plain_container_has_none(self):
+        X = shifted_corpus()
+        assert Quantizer(d=X.shape[1], bits=4, seed=42).encode(X).mean_dots is None
+
+    def test_nbytes_counts_the_column(self):
+        X = shifted_corpus(n=100, d=64)
+        c = Quantizer(d=64, bits=2, seed=42, mean=remex.corpus_mean(X)).encode(X)
+        assert c.nbytes == 100 * (64 * 2 // 8) + 100 * 4 + 100 * 4
+
+    def test_subset_and_packed_carry_it(self):
+        from remex import PackedVectors
+        X = shifted_corpus()
+        c = Quantizer(d=X.shape[1], bits=4, seed=42, mean=remex.corpus_mean(X)).encode(X)
+        idx = np.array([5, 1, 9])
+        assert np.array_equal(c.subset(idx).mean_dots, c.mean_dots[idx])
+        p = PackedVectors.from_compressed(c)
+        assert np.array_equal(p.mean_dots, c.mean_dots)
+        assert np.array_equal(p.subset(idx).mean_dots, c.mean_dots[idx])
+        assert np.array_equal(p.at_precision(2).mean_dots, c.mean_dots)
+        assert np.array_equal(p.to_compressed().mean_dots, c.mean_dots)
+
+    def test_npz_roundtrip(self, tmp_path):
+        from remex import CompressedVectors, PackedVectors
+        X = shifted_corpus()
+        pq = Quantizer(d=X.shape[1], bits=4, seed=42, mean=remex.corpus_mean(X))
+        c = pq.encode(X)
+        c.save(tmp_path / "c.npz")
+        back = CompressedVectors.load(tmp_path / "c.npz")
+        assert np.array_equal(back.mean_dots, c.mean_dots)
+        PackedVectors.from_compressed(c).save(tmp_path / "p.npz")
+        pback = PackedVectors.load(tmp_path / "p.npz")
+        assert np.array_equal(pback.mean_dots, c.mean_dots)
+        q = X[3]
+        assert np.allclose(pq.search(back, q, 5)[1], pq.search(c, q, 5)[1])
+
+    def test_arrow_roundtrip_keeps_mean_and_mean_dots(self, tmp_path):
+        pytest.importorskip("pyarrow")
+        from remex import CompressedVectors
+        X = shifted_corpus()
+        pq = Quantizer(d=X.shape[1], bits=4, seed=42, mean=remex.corpus_mean(X))
+        c = pq.encode(X)
+        c.save_arrow(str(tmp_path / "c.arrow"), seed=42)
+        back = CompressedVectors.load_arrow(str(tmp_path / "c.arrow"))
+        assert np.array_equal(back.mean, c.mean)
+        assert np.array_equal(back.mean_dots, c.mean_dots)
+        assert np.allclose(pq.decode(back), pq.decode(c))
+
+
+class TestCosineFactor:
+    @pytest.mark.parametrize("bits,want", [(1, 0.798), (2, 0.940), (3, 0.983), (4, 0.995)])
+    def test_direct_widths(self, bits, want):
+        pq = Quantizer(d=768, bits=bits, seed=42)
+        assert abs(pq._cosine_factor(None) - want) < 0.002
+
+    def test_matches_measured_cosine(self):
+        """kappa is the mean cosine between u and u_hat, at every level."""
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((2000, 256)).astype(np.float32)
+        pq = Quantizer(d=256, bits=8, seed=42)
+        c = pq.encode(X)
+        U = X / np.linalg.norm(X, axis=1, keepdims=True)
+        for p in (1, 2, 4, 8):
+            V = pq._unrotate_rows(pq._resolve_centroids(c, p)[pq._resolve_indices(c, p)])
+            cos = np.sum(V * U, axis=1) / np.linalg.norm(V, axis=1)
+            assert abs(cos.mean() - pq._cosine_factor(p)) < 0.003

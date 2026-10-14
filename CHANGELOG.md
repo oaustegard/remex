@@ -1,5 +1,107 @@
 # Changelog
 
+## v2.0.0 — 2026-10-14
+
+Centred search now scores the inner-product estimator that faiss's RaBitQ
+uses instead of `q . decode(x)`, and a centred container stores one more
+float per vector to make that possible. On SPECTER2 (9.5k docs, d=768,
+500 queries) centred recall@10 at 1/2/3/4 bits goes from
+0.689/0.853/0.917/0.953 to 0.812/0.903/0.943/0.967, level with faiss
+1.15.1 `IndexRaBitQ` (0.809/0.903/0.944/0.971) at 104/200/296/392 bytes
+per vector against its 104/212/308/404. The comparison, with paired
+bootstrap CIs on two SPECTER2 partitions and MiniLM, is in
+[`oaustegard/experiments/rabitq-vs-remex`](https://github.com/oaustegard/experiments/tree/main/rabitq-vs-remex).
+
+### Changed (breaking)
+
+- **Centred search scores `q.mu + mu.r + ||r|| (q - mu).u_hat / kappa`.**
+  `r = x - mu`, `u_hat` is the unit decoded direction, `mu . r` is stored
+  exactly, and `kappa` is the expected cosine between a vector and its
+  Lloyd-Max code (`Quantizer._cosine_factor`, computed from the codebook:
+  0.798/0.940/0.983/0.995 at 1-4 bits at d=768, from the Beta marginal
+  of a unit vector's coordinate, so it is also right at small d). 1.x scored `q . decode(x)`, which
+  multiplies the quantisation error by `||q||`; this multiplies it by
+  `||q - mu||`, 8.4 against 21.7 on SPECTER2, and takes `mu . r` out of the
+  quantised part. `kappa` matters at 1 bit (0.775 → 0.812) and little above
+  it. Every path uses it: `search`, `search_adc`, `search_twostage`,
+  `search_batch`, `PackedVectors`, `IVFCoarseIndex`, `GPUSearcher` and
+  `RemexIndex` MaxSim. Search scores for centred codes are therefore no
+  longer equal to `q . decode(x)`; `Quantizer._score_vectors` returns the
+  vectors and row bias that reproduce them.
+- **Centred containers store `||x - mu||` in `norms` and a new `mean_dots`
+  column, `mu . (x - mu)`, float32.** 1.x stored a length solved so that
+  `||mu + m u_hat|| == ||x||`, which carries `||x||` but not `mu . r`
+  separately. A centred index costs 4 more bytes per vector than in 1.x.
+- **Centred `decode` returns `w mu + kappa ||r|| u_hat`**, with `w` set so
+  that `mu . (decode(x) - mu)` equals the stored `mu . r`. 1.x scaled the
+  direction so that `||decode(x)|| == ||x||`, solving a quadratic whose
+  root could land on the far side of the mean. Reconstruction MSE drops on
+  every corpus measured: SPECTER2 1-bit 29.1 → 26.0, 2-bit 8.69 → 8.37;
+  a synthetic corpus shifted by 10 standard deviations, 2-bit 14.7 → 7.2.
+- **Centred containers written by 1.x are refused** with a `ValueError`
+  naming `remex < 2.0`. The codes are unchanged, so re-encoding the corpus
+  with 2.0 is the fix. Uncentred and scalar-mode containers, and everything
+  they compute, are unchanged.
+
+### Fixed
+
+Most of these were found by a fan-out of ten Haiku test agents over the
+2.0 change, and several predate it.
+
+- The mean and rotation guards ran in `_resolve_centroids`, which a warm
+  container skips: after one search with the right `Quantizer`, a
+  `Quantizer` with a different mean returned scores instead of raising.
+  The per-row scale functions now check too.
+- Centred encode cast the input to float32 before subtracting the mean,
+  so float64 input with a large mean lost the residual to rounding (up to
+  36% relative error in `||r||` at d=2). The residual and both columns are
+  now computed in float64 from the caller's values.
+- A `Quantizer` with a different bit width read another width's codes
+  without complaint, mapping them onto the wrong centroid table. It now
+  raises `bits mismatch`; read a lower level with `precision=`. The
+  README's `from_rows` example passed `bits=4` to an 8-bit quantizer and
+  ran only because of this.
+- `PackedVectors.subset` with a boolean mask set `n` to the mask length.
+  `subset` on both containers now accepts an empty list and refuses a mask
+  of the wrong length.
+- `IVFCoarseIndex.search_coarse` returned an empty result before running
+  the guards when the query's cell was empty; `search_batch` skipped them
+  on a warm cache in scalar mode.
+- `load_arrow` raised on a zero-row file.
+- `GPUSearcher` skipped the mode, rotation and mean guards; it now runs
+  them at construction. Its torch backend accepts negative-stride queries,
+  `search_batch` accepts one 1-D query, and `resident_bytes_gpu` counts
+  the per-precision scale and bias columns.
+- `RemexIndex.load` refuses a centred index written by 1.x at load time
+  rather than at the first search.
+
+- `save_arrow` / `load_arrow` dropped the corpus mean, so a centred
+  container read back from Arrow decoded as uncentred. The mean now rides in
+  the schema metadata and `mean_dots` in its own column.
+- `RemexIndex.add` called a second time now concatenates `mean_dots` with
+  the rows.
+
+### Added
+
+- Containers validate `mean_dots`: its length must equal `n`, it needs a
+  `mean`, and `PackedVectors.from_rows(mean=...)` requires it.
+
+- `PackedVectors.from_rows` takes `mean=` and `mean_dots=` for centred
+  codes.
+- `bench/centered_eval.py` ranks through `search_batch` and prints the
+  `q . decode(x)` ranking beside it.
+
+### Known
+
+- The first centred search on a container at a given precision makes one
+  extra O(n·d) pass over the codes for the row bias, then caches it. At
+  n=20,000, d=384 that cold search is about 2x 1.2.0; warm searches are
+  level within machine noise.
+- Which way to apply `kappa` is corpus-dependent at 1 bit. Search divides
+  by it (unbiased, RaBitQ), which wins on SPECTER2 by 0.15 recall@10;
+  multiplying by it (shrinkage) wins by about 0.04 on isotropic Gaussian
+  data around a mean. Real embeddings decided it.
+
 ## v1.2.0 — 2026-10-10
 
 `RemexIndex` puts a sentence-transformers model and a bit width in front of

@@ -78,7 +78,7 @@ def test_readme_examples_execute(tmp_path, monkeypatch):
         if "from_rows" in block:
             # from_rows models reading packed bytes back out of a database.
             pv = PackedVectors.from_compressed(
-                Quantizer(d=ns["d"], bits=4).encode(ns["corpus"])
+                ns["pq"].encode(ns["corpus"])
             )
             ns["rows"] = [bytes(r) for r in pv._packed]
             ns["norms"] = pv.norms
