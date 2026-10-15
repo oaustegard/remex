@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from remex._io import replacing
 from remex.packing import SUPPORTED_BITS, pack, unpack, packed_nbytes
 from remex.rotation import (
     ROTATION_CODES, rotation_from_code, validate_rotation,
@@ -107,7 +108,7 @@ def save_params(path: str | Path, quantizer: "Quantizer") -> None:
     header[4:8] = struct.pack("<I", d)
     header[8] = bits & 0xFF
     header[9] = ROTATION_CODES[rotation]
-    with open(path, "wb") as f:
+    with replacing(path) as tmp, open(tmp, "wb") as f:
         f.write(bytes(header))
         f.write(R.tobytes())
         f.write(boundaries.tobytes())
@@ -120,6 +121,11 @@ def save_pq(path: str | Path, compressed: "CompressedVectors") -> None:
     A scalar-mode container (``norms is None``) sets the no-norms flag and
     writes no norms section. Such a file is readable by ``load_pq`` but not
     yet by the Mojo port.
+
+    The format has no field for the seed or a scalar-mode scale, so a
+    container read back from ``.pq`` does not record them and the quantizer
+    cannot check them; ``.npz`` and Arrow do. The write replaces any
+    previous file only once complete.
     """
     if getattr(compressed, "mean", None) is not None:
         raise ValueError(
@@ -147,7 +153,7 @@ def save_pq(path: str | Path, compressed: "CompressedVectors") -> None:
     if compressed.norms is None:
         header[18] = PQ_FLAG_NO_NORMS
 
-    with open(path, "wb") as f:
+    with replacing(path) as tmp, open(tmp, "wb") as f:
         f.write(bytes(header))
         f.write(packed.tobytes())
         if compressed.norms is not None:

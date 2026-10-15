@@ -4,7 +4,7 @@
 
 **remex** (formerly polar-embed) is a Python library for retrieval-validated embedding compression. It implements random orthogonal rotation + Lloyd-Max scalar quantization (from TurboQuant, Zandieh et al. ICLR 2026) to compress embedding vectors 2-16x with measured recall, optimized for nearest-neighbor retrieval in RAG systems.
 
-Key differentiator: **data-oblivious** — no training required. The codes a quantizer writes are fully determined by `(dimension, bits, seed, rotation, normalize, scale)`, with one opt-in exception: `mean` (see design decision 4). `renorm` is a further constructor argument but deliberately not part of that tuple: it changes how codes are read, not what they are. `renorm` is a seventh constructor argument but deliberately not part of that tuple: it changes how codes are read, not what they are.
+Key differentiator: **data-oblivious** — no training required. The codes a quantizer writes are fully determined by `(dimension, bits, seed, rotation, normalize, scale)`, with one opt-in exception: `mean` (see design decision 4). `renorm` is a further constructor argument but deliberately not part of that tuple: it changes how codes are read, not what they are.
 
 ## Architecture
 
@@ -126,6 +126,15 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
 - **`"rht"` takes at least two rounds at every d** (`rotation.rht_rounds`). One round is seed-blind: a signed
   permutation after a fixed WHT, which the per-coordinate symmetric codebook cannot see (#89).
   `tests/test_rht_seed.py` compares decodes across seeds, not matrices, because `R` differs by seed either way.
+- **So are the seed, `d` and scalar `scale`** (since 2.1): containers carry `seed` and, in scalar mode, `scale`
+  (`.npz` keys, Arrow metadata; `.pq` has no field), and `_check_rotation` runs `_check_d` and `_check_seed` on
+  every read path. `seed is None` means "not recorded" (hand-built containers, pre-2.1 files) and is not checked;
+  `rotation="none"` ignores the seed. A new container-producing path must pass `seed`/`scale` through, as
+  `subset`, `at_precision`, `from_compressed` and `to_compressed` do; `tests/test_integrity.py` checks them.
+- **Every writer is all-or-nothing**: `save`, `PackedVectors.save`, `save_arrow`, `save_pq`, `save_params` and
+  `RemexIndex.save` write through `remex._io.replacing`, which writes a temporary sibling and `os.replace`s it.
+  2.0.0 opened the destination directly; a SIGKILL mid-overwrite left 0 bytes. `.npz` readers go through
+  `remex._io.open_npz`, which names a damaged or foreign file instead of passing NumPy's errors through.
 - **So is the mode**: a scalar-mode container (`normalize=False`) has `norms is None`, and every serializer
   records that by *omitting* the norms column (`.npz`/Arrow) or setting the no-norms flag (`.pq` byte 18,
   bit 0). Decoding or searching across the two modes raises, like a rotation mismatch.

@@ -20,7 +20,7 @@ from remex import CompressedVectors
 loaded = CompressedVectors.load("index.npz")
 ```
 
-The quantizer is fully determined by `(d, bits, seed, rotation, normalize, scale)` — no training, no fitting, no index to ship. `rotation` defaults to `"haar"` and is part of the encoding exactly as `seed` is; every container records it, and decoding against the wrong one raises rather than returning wrong-but-plausible vectors. `normalize` and `scale` select the pipeline described below versus [scalar mode](#scalar-mode-codes-as-hash-keys), and default to the former.
+The quantizer is fully determined by `(d, bits, seed, rotation, normalize, scale)` — no training, no fitting, no index to ship. `rotation` defaults to `"rht"` for even `d` (`"haar"` for odd) and is part of the encoding exactly as `seed` is. Every container records `d`, `bits`, `seed`, `rotation`, the mode and, in scalar mode, `scale`, and decoding against a quantizer that differs in any of them raises rather than returning wrong-but-plausible vectors. `save` replaces an existing file only once the new one is complete, so an interrupted save keeps the old index. `normalize` and `scale` select the pipeline described below versus [scalar mode](#scalar-mode-codes-as-hash-keys), and default to the former.
 
 
 ### With sentence-transformers
@@ -262,7 +262,7 @@ Main quantizer class (formerly `PolarQuantizer`, which remains available as a de
 
 - **`d`** — Vector dimension (must match your embeddings).
 - **`bits`** — Bits per coordinate: 1-4 or 8. Sweet spot is 3-4. Use 8 for near-lossless.
-- **`seed`** — Random seed for the rotation matrix. Same seed = same quantizer.
+- **`seed`** — Random seed for the rotation matrix. Same seed = same quantizer. Since 2.1 every container records it (`.npz` and Arrow files too; `.pq` has no field for it), and a quantizer with another seed is refused. Containers and files written before 2.1 record no seed and are not checked.
 - **`rotation`** — `"rht"` (default for even `d`), `"haar"` (default for odd `d`), or `"none"` (the identity — see [scalar mode](#scalar-mode-codes-as-hash-keys)). Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
 - **`normalize`** — `True` (default) factors each vector into unit direction plus a stored norm, as described above. `False` selects [scalar mode](#scalar-mode-codes-as-hash-keys): quantize the coordinates directly, store no norms. Also part of the encoding — a mismatch raises.
 - **`scale`** — Scalar mode only (default `1.0`): the coordinate standard deviation the Lloyd-Max cells are cut for. The normalizing path derives it from the unit sphere as `1/sqrt(d)` and rejects an explicit value.
@@ -478,7 +478,7 @@ What is unchanged: Lloyd-Max cell shaping, Matryoshka nesting (right-shift a cod
 
 **You own the range conditioning.** remex stays data-oblivious and will not measure your data to pick cells. Bound your inputs or push heavy tails through `arcsinh`/`log`, then set `scale` to the spread you conditioned them to; anything past `±3 * scale` lands in an outermost cell.
 
-Scalar-mode containers carry `norms is None`, which is how every serializer marks them: no `norms` entry in `.npz`, no `norms` column in Arrow, and the no-norms flag (byte 18, bit 0) in `.pq`. Mixing the two modes raises rather than silently rescaling every coordinate. The Mojo port always normalizes, so it does not read scalar-mode `.pq` files and `save_params` rejects a scalar quantizer.
+Scalar-mode containers carry `norms is None`, which is how every serializer marks them: no `norms` entry in `.npz`, no `norms` column in Arrow, and the no-norms flag (byte 18, bit 0) in `.pq`. Mixing the two modes raises rather than silently rescaling every coordinate, and so does reading scalar codes with a different `scale`, which `.npz` and Arrow record (since 2.1). The Mojo port always normalizes, so it does not read scalar-mode `.pq` files and `save_params` rejects a scalar quantizer.
 
 ## vs TurboQuant
 

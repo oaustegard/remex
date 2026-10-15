@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+Six defects found by an outside-in behavior spec of 2.0.0
+([`oaustegard/experiments/remex-product-description`](https://github.com/oaustegard/experiments/tree/main/remex-product-description/bug-triage.md)),
+each now covered by `tests/test_integrity.py`.
+
+### Fixed
+
+- **A quantizer with a different `seed` is refused.** 2.0.0 decoded any
+  container with any seed and returned vectors unrelated to the originals
+  (mean cosine −0.02 against 0.995 at d=64, 4 bits), the failure the rotation
+  check exists to prevent. Containers now record `seed` (`.npz` key, Arrow
+  metadata, which `save_arrow` fills from the container when `seed=` is not
+  passed and refuses when it contradicts), and every read path checks it.
+  A container with no recorded seed (built by hand, or written before this
+  release, or read from `.pq`, which has no field for it) is not checked, so
+  existing files keep loading. `rotation="none"` ignores the seed.
+- **An interrupted save keeps the previous file.** Every writer opened its
+  destination directly, so a save killed partway left a truncated file and
+  no copy of the index it was replacing (109 MB to 0 bytes). `save`,
+  `PackedVectors.save`, `save_arrow`, `save_pq`, `save_params` and
+  `RemexIndex.save` now write a temporary sibling and rename it into place.
+- **Scalar mode records `scale`**, and a quantizer with another `scale` is
+  refused instead of rescaling every decoded coordinate by the ratio.
+- **A dimension mismatch is refused** with "dimension mismatch: these codes
+  are d=64 but this Quantizer is d=32" on every path. Before, the error
+  depended on the rotation, and under `rotation="none"` in scalar mode
+  decode returned the wrong width silently.
+- **`load` finds the file `save` wrote.** `save("index")` writes
+  `index.npz`, as NumPy always did; `load("index")` now reads it, and
+  `save` returns the path it wrote.
+- **Damaged and foreign files say so.** An empty, truncated or non-archive
+  file raises "is not a readable .npz archive" instead of `EOFError`,
+  `BadZipFile`, or NumPy's suggestion to set `allow_pickle=True`; an
+  archive without remex's entries raises "not a remex container". A
+  container whose `rotation` was set to an unknown name is refused at
+  `save`, before anything is written, rather than producing a file `load`
+  refuses. `Quantizer(bits=0)` and `bits=9` give the same message as 5-7.
+
 ## v2.0.0 — 2026-10-14
 
 Centred search now scores the inner-product estimator that faiss's RaBitQ

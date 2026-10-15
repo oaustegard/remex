@@ -9,6 +9,7 @@ from remex.codebook import (
     assign_codes,
     coordinate_sigma, lloyd_max_codebook, nested_codebooks,
 )
+from remex._io import npz_path, open_npz, replacing
 from remex.packing import SUPPORTED_BITS, pack, unpack, packed_nbytes
 from remex.rotation import (
     LEGACY_ROTATION, RHTOperator, haar_rotation, identity_rotation,
@@ -35,6 +36,35 @@ def _as_mean_dots(mean_dots, n: int, mean) -> Optional[np.ndarray]:
     if out.shape[0] != n:
         raise ValueError(f"mean_dots has {out.shape[0]} rows, the codes have {n}")
     return out
+
+
+def _as_seed(seed) -> Optional[int]:
+    """A recorded seed as a plain int, or ``None`` for "not recorded"."""
+    return None if seed is None else int(seed)
+
+
+def _as_scale(scale) -> Optional[float]:
+    """A recorded scalar-mode scale as a float, or ``None``."""
+    return None if scale is None else float(scale)
+
+
+def _tag_npz(fields: dict, seed, scale) -> dict:
+    """Add the recorded seed and scale to a container's ``.npz`` fields."""
+    if seed is not None:
+        fields["seed"] = np.int64(seed)
+    if scale is not None:
+        fields["scale"] = np.float64(scale)
+    return fields
+
+
+def _tag_from_npz(data):
+    """``(seed, scale)`` from an ``.npz`` archive; ``None`` where absent.
+
+    Files written before remex 2.1 record neither, and read back as
+    "unknown", which the quantizer does not check."""
+    seed = int(data["seed"]) if "seed" in data.files else None
+    scale = float(data["scale"]) if "scale" in data.files else None
+    return seed, scale
 
 
 def _as_rows(idx, n: int) -> np.ndarray:
@@ -187,13 +217,15 @@ class CompressedVectors:
     """
 
     __slots__ = ("indices", "norms", "d", "bits", "n", "rotation", "mean",
-                 "mean_dots", "_x_hat_rot", "_dir_len")
+                 "mean_dots", "seed", "scale", "_x_hat_rot", "_dir_len")
 
     def __init__(self, indices: np.ndarray, norms: Optional[np.ndarray],
                  d: int, bits: int,
                  rotation: str = LEGACY_ROTATION,
                  mean: Optional[np.ndarray] = None,
-                 mean_dots: Optional[np.ndarray] = None):
+                 mean_dots: Optional[np.ndarray] = None,
+                 seed: Optional[int] = None,
+                 scale: Optional[float] = None):
         self.indices = indices  # (n, d) uint8 — unpacked for fast access
         self.norms = norms
         self.d = d
@@ -208,6 +240,13 @@ class CompressedVectors:
         #: holding ``||x - mu||`` it gives the search its row offset and
         #: ``decode`` the original length. See ``Quantizer`` design notes.
         self.mean_dots = _as_mean_dots(mean_dots, self.n, self.mean)
+        #: Seed of the quantizer that wrote these codes, or None when not
+        #: recorded (containers built by hand, files from remex < 2.1). Part
+        #: of the encoding like ``rotation``: a quantizer with another seed
+        #: is refused rather than decoding into an unrelated rotation.
+        self.seed = _as_seed(seed)
+        #: Scalar mode only: the ``scale`` the codebook was cut for, or None.
+        self.scale = _as_scale(scale)
         self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
         self._dir_len = {}  # precision -> (n,) decoded-direction length; ("bias"|"mean_coef", p) -> centred per-row terms
 
@@ -224,6 +263,7 @@ class CompressedVectors:
             None if self.norms is None else self.norms[idx],
             self.d, self.bits, self.rotation, self.mean,
             None if self.mean_dots is None else self.mean_dots[idx],
+            self.seed, self.scale,
         )
         if self._x_hat_rot is not None:
             sub._x_hat_rot = self._x_hat_rot[idx]
@@ -260,15 +300,26 @@ class CompressedVectors:
         self._x_hat_rot = None
         self._dir_len = {}
 
-    def save(self, path: str):
-        """Save to compressed .npz file with bit-packed indices.
+    def save(self, path: str) -> str:
+        """Save to compressed .npz file with bit-packed indices; return its path.
+
+        A string path without ``.npz`` gains it, as NumPy does; the returned
+        path is the name actually written, and ``load`` accepts either.
+
+        The write is all-or-nothing: the file goes to a temporary sibling and
+        replaces ``path`` only once complete, so an interrupted save leaves
+        any previous file at ``path`` intact.
 
         Scalar-mode containers write no ``norms`` entry at all; its absence
         is what marks the file as scalar mode on load. Every file written
         by the normalizing path has one, so there is no ambiguity with
         older files.
         """
-        np.savez_compressed(path, **self._npz_fields())
+        fields = self._npz_fields()
+        path = npz_path(path)
+        with replacing(path, suffix=".npz") as tmp:
+            np.savez_compressed(tmp, **fields)
+        return path
 
     def _npz_fields(self) -> dict:
         """The arrays ``save`` writes, for callers that add their own keys
@@ -279,7 +330,7 @@ class CompressedVectors:
             "d": np.int32(self.d),
             "bits": np.int32(self.bits),
             "n": np.int32(self.n),
-            "rotation": np.str_(self.rotation),
+            "rotation": np.str_(validate_rotation(self.rotation)),
         }
         if self.norms is not None:
             fields["norms"] = self.norms
@@ -287,7 +338,7 @@ class CompressedVectors:
             fields["mean"] = self.mean
         if self.mean_dots is not None:
             fields["mean_dots"] = self.mean_dots
-        return fields
+        return _tag_npz(fields, self.seed, self.scale)
 
     @classmethod
     def load(cls, path: str) -> "CompressedVectors":
@@ -298,24 +349,30 @@ class CompressedVectors:
         constant rather than the current default.
 
         A file with no ``norms`` entry is scalar mode (``normalize=False``).
+
+        ``path`` may omit the ``.npz`` that ``save`` added. A file that is not
+        a remex container raises ``ValueError`` saying so.
         """
-        data = np.load(path)
-        d = int(data["d"])
-        bits = int(data["bits"])
-        n = int(data["n"])
-        rotation = str(data["rotation"]) if "rotation" in data else LEGACY_ROTATION
+        with open_npz(path) as data:
+            d = int(data["d"])
+            bits = int(data["bits"])
+            n = int(data["n"])
+            rotation = (str(data["rotation"]) if "rotation" in data
+                        else LEGACY_ROTATION)
 
-        if "packed_indices" in data:
-            flat = unpack(data["packed_indices"], bits, n * d)
-            indices = flat.reshape(n, d)
-        else:
-            # Backward compat: old format stored unpacked indices
-            indices = data["indices"]
+            if "packed_indices" in data:
+                flat = unpack(data["packed_indices"], bits, n * d)
+                indices = flat.reshape(n, d)
+            else:
+                # Backward compat: old format stored unpacked indices
+                indices = data["indices"]
 
-        norms = data["norms"] if "norms" in data else None
-        mean = data["mean"] if "mean" in data else None
-        mean_dots = data["mean_dots"] if "mean_dots" in data else None
-        return cls(indices, norms, d, bits, rotation, mean, mean_dots)
+            norms = data["norms"] if "norms" in data else None
+            mean = data["mean"] if "mean" in data else None
+            mean_dots = data["mean_dots"] if "mean_dots" in data else None
+            seed, scale = _tag_from_npz(data)
+        return cls(indices, norms, d, bits, rotation, mean, mean_dots,
+                   seed, scale)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format, packing indices for storage.
@@ -360,7 +417,8 @@ class PackedVectors:
     """
 
     __slots__ = ("_packed", "norms", "d", "bits", "n", "rotation", "mean",
-                 "mean_dots", "_row_bytes", "_row_aligned", "_dir_len")
+                 "mean_dots", "seed", "scale", "_row_bytes", "_row_aligned",
+                 "_dir_len")
 
     def __init__(
         self,
@@ -372,6 +430,8 @@ class PackedVectors:
         rotation: str = LEGACY_ROTATION,
         mean: Optional[np.ndarray] = None,
         mean_dots: Optional[np.ndarray] = None,
+        seed: Optional[int] = None,
+        scale: Optional[float] = None,
     ):
         """
         Args:
@@ -392,6 +452,8 @@ class PackedVectors:
         self.rotation = validate_rotation(rotation)
         self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
         self.mean_dots = _as_mean_dots(mean_dots, n, self.mean)
+        self.seed = _as_seed(seed)  # as on CompressedVectors
+        self.scale = _as_scale(scale)
         self._row_bytes = packed_nbytes(1, d, bits)
         self._row_aligned = (d * bits) % 8 == 0
         self._dir_len = {}  # precision -> (n,) decoded-direction length; ("bias"|"mean_coef", p) -> centred per-row terms
@@ -468,7 +530,8 @@ class PackedVectors:
         mean_dots = (None if compressed.mean_dots is None
                      else compressed.mean_dots.copy())
         return cls(packed, norms, n, d, bits, compressed.rotation, mean,
-                   mean_dots)
+                   mean_dots, getattr(compressed, "seed", None),
+                   getattr(compressed, "scale", None))
 
     @classmethod
     def from_rows(
@@ -480,6 +543,8 @@ class PackedVectors:
         rotation: str = LEGACY_ROTATION,
         mean: Optional[np.ndarray] = None,
         mean_dots: Optional[np.ndarray] = None,
+        seed: Optional[int] = None,
+        scale: Optional[float] = None,
     ) -> "PackedVectors":
         """Reconstruct from database packed byte rows.
 
@@ -495,6 +560,10 @@ class PackedVectors:
                 historical value, not the library default.
             mean: Corpus mean, for centred codes (``Quantizer(mean=...)``).
             mean_dots: (n,) ``mu . (x - mu)`` per row, required with ``mean``.
+            seed: The seed of the quantizer that wrote the rows, if the
+                schema stores it. Recorded so a quantizer with another seed
+                is refused; ``None`` leaves it unchecked.
+            scale: Scalar mode only: the ``scale`` the rows were cut for.
 
         Returns:
             PackedVectors instance.
@@ -511,7 +580,8 @@ class PackedVectors:
             norms = np.asarray(norms, dtype=np.float32)
         if mean is not None and mean_dots is None:
             raise ValueError("centred rows need mean_dots alongside mean")
-        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots)
+        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots,
+                   seed, scale)
 
     def at_precision(self, target_bits: int) -> "PackedVectors":
         """Derive a lower-bit representation via Matryoshka right-shift.
@@ -553,7 +623,7 @@ class PackedVectors:
         return PackedVectors(
             packed_target, self._copy_norms(), self.n, self.d, target_bits,
             self.rotation, None if self.mean is None else self.mean.copy(),
-            self._copy_mean_dots(),
+            self._copy_mean_dots(), self.seed, self.scale,
         )
 
     def to_compressed(self) -> CompressedVectors:
@@ -562,7 +632,7 @@ class PackedVectors:
         return CompressedVectors(
             indices, self._copy_norms(), self.d, self.bits, self.rotation,
             None if self.mean is None else self.mean.copy(),
-            self._copy_mean_dots(),
+            self._copy_mean_dots(), self.seed, self.scale,
         )
 
     def subset(self, idx: np.ndarray) -> "PackedVectors":
@@ -577,6 +647,8 @@ class PackedVectors:
             self.rotation,
             None if self.mean is None else self.mean.copy(),
             None if self.mean_dots is None else self.mean_dots[idx].copy(),
+            self.seed,
+            self.scale,
         )
 
     def _copy_norms(self) -> Optional[np.ndarray]:
@@ -601,26 +673,32 @@ class PackedVectors:
         """Ratio vs float32 storage."""
         return (self.n * self.d * 4) / self.nbytes
 
-    def save(self, path: str):
-        """Save to compressed .npz file.
+    def save(self, path: str) -> str:
+        """Save to compressed .npz file; return the path written.
 
         As with ``CompressedVectors.save``, a scalar-mode container writes
-        no ``norms`` entry.
+        no ``norms`` entry, a missing ``.npz`` suffix is added, and the
+        write replaces any previous file only once it is complete.
         """
         optional = {} if self.norms is None else {"norms": self.norms}
         if self.mean is not None:
             optional["mean"] = self.mean
         if self.mean_dots is not None:
             optional["mean_dots"] = self.mean_dots
-        np.savez_compressed(
-            path,
-            packed_indices=self._packed.ravel(),
-            d=np.int32(self.d),
-            bits=np.int32(self.bits),
-            n=np.int32(self.n),
-            rotation=np.str_(self.rotation),
-            **optional,
-        )
+        _tag_npz(optional, self.seed, self.scale)
+        rotation = np.str_(validate_rotation(self.rotation))
+        path = npz_path(path)
+        with replacing(path, suffix=".npz") as tmp:
+            np.savez_compressed(
+                tmp,
+                packed_indices=self._packed.ravel(),
+                d=np.int32(self.d),
+                bits=np.int32(self.bits),
+                n=np.int32(self.n),
+                rotation=rotation,
+                **optional,
+            )
+        return path
 
     @classmethod
     def load(cls, path: str) -> "PackedVectors":
@@ -629,18 +707,21 @@ class PackedVectors:
         A file with no ``rotation`` entry predates the field and is Haar.
         A file with no ``norms`` entry is scalar mode.
         """
-        data = np.load(path)
-        d = int(data["d"])
-        bits = int(data["bits"])
-        n = int(data["n"])
-        rotation = str(data["rotation"]) if "rotation" in data else LEGACY_ROTATION
-        row_bytes = packed_nbytes(1, d, bits)
-        packed_flat = data["packed_indices"]
-        packed = packed_flat.reshape(n, row_bytes)
-        norms = data["norms"] if "norms" in data else None
-        mean = data["mean"] if "mean" in data else None
-        mean_dots = data["mean_dots"] if "mean_dots" in data else None
-        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots)
+        with open_npz(path) as data:
+            d = int(data["d"])
+            bits = int(data["bits"])
+            n = int(data["n"])
+            rotation = (str(data["rotation"]) if "rotation" in data
+                        else LEGACY_ROTATION)
+            row_bytes = packed_nbytes(1, d, bits)
+            packed_flat = data["packed_indices"]
+            packed = packed_flat.reshape(n, row_bytes)
+            norms = data["norms"] if "norms" in data else None
+            mean = data["mean"] if "mean" in data else None
+            mean_dots = data["mean_dots"] if "mean_dots" in data else None
+            seed, scale = _tag_from_npz(data)
+        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots,
+                   seed, scale)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format.
@@ -653,9 +734,20 @@ class PackedVectors:
 
         Args:
             path: Output file path.
-            seed: Quantizer seed to store in metadata.
+            seed: Quantizer seed to store in metadata. Defaults to the seed
+                the container recorded; passing a different one raises.
             **extra_metadata: Additional key-value pairs for schema metadata.
+
+        Like ``save``, the write replaces any previous file only once it is
+        complete.
         """
+        if seed is None:
+            seed = self.seed
+        elif self.seed is not None and int(seed) != self.seed:
+            raise ValueError(
+                f"seed={seed} contradicts the seed these codes were encoded "
+                f"with ({self.seed}); the file would record the wrong one."
+            )
         try:
             import pyarrow as pa
             import pyarrow.feather as feather
@@ -670,10 +762,12 @@ class PackedVectors:
             b"d": str(self.d).encode(),
             b"bits": str(self.bits).encode(),
             b"n": str(self.n).encode(),
-            b"rotation": self.rotation.encode(),
+            b"rotation": validate_rotation(self.rotation).encode(),
         }
         if seed is not None:
-            metadata[b"seed"] = str(seed).encode()
+            metadata[b"seed"] = str(int(seed)).encode()
+        if self.scale is not None:
+            metadata[b"scale"] = repr(self.scale).encode()
         for k, v in extra_metadata.items():
             key = k.encode() if isinstance(k, str) else k
             metadata[key] = str(v).encode()
@@ -700,7 +794,8 @@ class PackedVectors:
         table = pa.table(
             {f.name: columns[f.name] for f in fields}, schema=schema
         )
-        feather.write_feather(table, path)
+        with replacing(path) as tmp:
+            feather.write_feather(table, tmp)
 
     @classmethod
     def load_arrow(cls, path: str, memory_map: bool = False) -> "PackedVectors":
@@ -745,6 +840,8 @@ class PackedVectors:
             table.column("mean_dots").to_numpy().astype(np.float32)
             if "mean_dots" in table.schema.names else None
         )
+        seed = int(metadata[b"seed"]) if b"seed" in metadata else None
+        scale = float(metadata[b"scale"]) if b"scale" in metadata else None
 
         # Extract packed data from contiguous Arrow buffer
         packed_col = table.column("packed_indices").combine_chunks()
@@ -757,7 +854,8 @@ class PackedVectors:
                 offset: offset + n * row_bytes]
             packed = packed_flat.reshape(n, row_bytes).copy()
 
-        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots)
+        return cls(packed, norms, n, d, bits, rotation, mean, mean_dots,
+                   seed, scale)
 
 
 #: Row blocks in ``encode`` are sized to about this many input floats. Only
@@ -878,13 +976,12 @@ class Quantizer:
                  rotation: Optional[str] = None, normalize: bool = True,
                  scale: Optional[float] = None, renorm: bool = True,
                  mean: Optional[np.ndarray] = None):
-        if bits < 1 or bits > 8:
-            raise ValueError(f"bits must be 1-4 or 8, got {bits}")
         if bits not in SUPPORTED_BITS:
+            why = (" 5-7 bit widths offer negligible benefit over 4-bit or "
+                   "8-bit." if 5 <= bits <= 7 else "")
             raise ValueError(
                 f"bits={bits} is not supported. Use one of "
-                f"{list(SUPPORTED_BITS)}. 5-7 bit widths offer negligible "
-                f"benefit over 4-bit or 8-bit."
+                f"{list(SUPPORTED_BITS)}.{why}"
             )
 
         if rotation is None:
@@ -1006,11 +1103,12 @@ class Quantizer:
             )
         if self.mean is None:
             return CompressedVectors(
-                indices, norms, self.d, self.bits, self.rotation
+                indices, norms, self.d, self.bits, self.rotation,
+                seed=self.seed,
             )
         return CompressedVectors(
             indices, lengths_out, self.d, self.bits, self.rotation, self.mean,
-            dots_out,
+            dots_out, seed=self.seed,
         )
 
     def _encode_scalar(self, X: np.ndarray) -> CompressedVectors:
@@ -1039,7 +1137,9 @@ class Quantizer:
             X_rot = self._rotate_rows(X[lo:hi])
             indices[lo:hi] = assign_codes(X_rot, self.boundaries, self.bits)
 
-        return CompressedVectors(indices, None, self.d, self.bits, self.rotation)
+        return CompressedVectors(indices, None, self.d, self.bits,
+                                 self.rotation, seed=self.seed,
+                                 scale=self.scale)
 
     @property
     def R(self) -> np.ndarray:
@@ -1096,6 +1196,7 @@ class Quantizer:
         legacy container whose recorded value is wrong, set
         ``compressed.rotation`` before calling.
         """
+        self._check_d(compressed)
         stored = getattr(compressed, "rotation", LEGACY_ROTATION)
         if stored != self.rotation:
             raise ValueError(
@@ -1107,6 +1208,55 @@ class Quantizer:
                 f"of all stored bits.)"
             )
         self._check_mode(compressed)
+        self._check_seed(compressed)
+
+    def _check_d(self, compressed) -> None:
+        """Refuse codes of another dimension before any array op trips on them.
+
+        Without this the failure depended on the rotation (a shape error from
+        RHT, a matmul error from Haar, an IndexError from ADC), and under
+        ``rotation="none"`` in scalar mode decode returned the container's
+        width without complaint.
+        """
+        d = getattr(compressed, "d", self.d)
+        if d != self.d:
+            raise ValueError(
+                f"dimension mismatch: these codes are d={d} but this "
+                f"Quantizer is d={self.d}. Rebuild the Quantizer with d={d}."
+            )
+
+    def _check_seed(self, compressed) -> None:
+        """Refuse codes a quantizer with a different seed wrote.
+
+        The seed selects the rotation exactly as ``rotation`` selects its
+        family, so a mismatch decodes into an unrelated basis: measured mean
+        cosine to the originals -0.02 against 0.995 at d=64, 4 bits. A
+        container that does not record its seed (``seed is None``: built by
+        hand, or read from a file written before remex 2.1 or from ``.pq``)
+        is not checked. ``rotation="none"`` ignores the seed, so it is not
+        checked there either.
+
+        Scalar mode's ``scale`` is checked here for the same reason: it is
+        part of the encoding and a mismatch rescales every coordinate.
+        """
+        stored = getattr(compressed, "seed", None)
+        if (stored is not None and self.rotation != "none"
+                and int(stored) != int(self.seed)):
+            raise ValueError(
+                f"seed mismatch: these codes were encoded with seed={stored} "
+                f"but this Quantizer uses seed={self.seed}. Rebuild the "
+                f"Quantizer with seed={stored}. (Decoding with another seed "
+                f"rotates into an unrelated basis and returns plausible-"
+                f"looking vectors that are wrong.)"
+            )
+        scale = getattr(compressed, "scale", None)
+        if (scale is not None and not self.normalize
+                and not np.isclose(scale, self.scale, rtol=1e-9, atol=0.0)):
+            raise ValueError(
+                f"scale mismatch: these scalar-mode codes were cut for "
+                f"scale={scale} but this Quantizer uses scale={self.scale}. "
+                f"Rebuild the Quantizer with scale={scale}."
+            )
 
     def _check_bits(self, compressed) -> None:
         """Refuse codes written at a different bit width.

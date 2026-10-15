@@ -47,6 +47,7 @@ import numpy as np
 from remex.core import (
     AnisotropyWarning, CompressedVectors, Quantizer, anisotropy, corpus_mean,
 )
+from remex._io import replacing
 from remex.packing import SUPPORTED_BITS
 
 #: Similarities a remex index can rank by. All are built from inner
@@ -316,6 +317,7 @@ class RemexIndex:
                 old.d, old.bits, old.rotation, old.mean,
                 None if old.mean_dots is None
                 else np.concatenate([old.mean_dots, codes.mean_dots]),
+                old.seed, old.scale,
             )
         if self.multi_vector:
             base = 0 if self.offsets is None else self.offsets[-1]
@@ -432,10 +434,11 @@ class RemexIndex:
         meta = {"format": _FORMAT, "seed": self.seed,
                 "similarity": self.similarity, "center": self.center}
         extra = {} if self.offsets is None else {"doc_offsets": self.offsets}
-        np.savez_compressed(
-            path, remex_index=np.str_(json.dumps(meta)),
-            **self.compressed._npz_fields(), **extra,
-        )
+        fields = self.compressed._npz_fields()
+        with replacing(path, suffix=".npz") as tmp:
+            np.savez_compressed(
+                tmp, remex_index=np.str_(json.dumps(meta)), **fields, **extra,
+            )
         return path
 
     @classmethod
