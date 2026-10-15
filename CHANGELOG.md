@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v2.1.0 — 2026-10-15
 
 Six defects found by an outside-in behavior spec of 2.0.0
 ([`oaustegard/experiments/remex-product-description`](https://github.com/oaustegard/experiments/tree/main/remex-product-description/bug-triage.md)),
