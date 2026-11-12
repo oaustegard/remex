@@ -63,11 +63,18 @@ def test_readme_examples_execute(tmp_path, monkeypatch):
     # The sentence-transformers block runs against the stand-in model: CI has
     # no torch, and a real run would download weights. What it checks is the
     # remex side of the block, which is what drifts.
-    from _fake_st import FakeMultiVectorModel, SentenceTransformer
+    from _fake_st import FakeMultiVectorModel, FakeTokenPooling, SentenceTransformer
     stub = types.ModuleType("sentence_transformers")
     stub.SentenceTransformer = SentenceTransformer
     stub.MultiVectorEncoder = lambda name, **kw: FakeMultiVectorModel()
+    modules = types.ModuleType("sentence_transformers.multi_vector_encoder.modules")
+    modules.HierarchicalTokenPooling = FakeTokenPooling
+    mve = types.ModuleType("sentence_transformers.multi_vector_encoder")
+    mve.modules = modules
+    stub.multi_vector_encoder = mve
     monkeypatch.setitem(sys.modules, "sentence_transformers", stub)
+    monkeypatch.setitem(sys.modules, "sentence_transformers.multi_vector_encoder", mve)
+    monkeypatch.setitem(sys.modules, "sentence_transformers.multi_vector_encoder.modules", modules)
     ns: dict = {}
     _seed_fixtures(ns, 384)
 

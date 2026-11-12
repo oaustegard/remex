@@ -67,9 +67,10 @@ class FakeMultiVectorModel:
         v = rng.standard_normal(self.dim) + self.shared
         return (v / np.linalg.norm(v)).astype(np.float32)
 
-    def encode(self, sentences, convert_to_numpy=True, **kwargs):
-        self.calls.append(("encode", len(sentences), kwargs))
-        return [np.stack([self._tok(w) for w in s.split()]) for s in sentences]
+    def encode(self, sentences, convert_to_numpy=True, token_pooling=None, **kwargs):
+        self.calls.append(("encode", len(sentences), kwargs, token_pooling))
+        mats = [np.stack([self._tok(w) for w in s.split()]) for s in sentences]
+        return mats if token_pooling is None else token_pooling.pool(mats)
 
     def encode_query(self, sentences, **kwargs):
         self.calls.append(("query", len(sentences)))
@@ -78,3 +79,28 @@ class FakeMultiVectorModel:
     def encode_document(self, sentences, **kwargs):
         self.calls.append(("document", len(sentences)))
         return self.encode(sentences, **kwargs)
+
+
+class FakeTokenPooling:
+    """Stands in for ``HierarchicalTokenPooling``: keeps the first token and
+    replaces each later run of ``pool_factor`` tokens with its renormalised
+    mean, and reports its settings the way sentence-transformers modules do."""
+
+    config_keys = ["pool_factor", "num_protected_tokens"]
+
+    def __init__(self, pool_factor=2, num_protected_tokens=1, **kwargs):
+        self.pool_factor = pool_factor
+        self.num_protected_tokens = num_protected_tokens
+
+    def get_config_dict(self):
+        return {k: getattr(self, k) for k in self.config_keys}
+
+    def pool(self, mats):
+        out = []
+        for m in mats:
+            keep, rest = m[:self.num_protected_tokens], m[self.num_protected_tokens:]
+            groups = [rest[i:i + self.pool_factor] for i in range(0, len(rest), self.pool_factor)]
+            means = [g.mean(0) for g in groups]
+            means = [v / np.linalg.norm(v) for v in means]
+            out.append(np.vstack([keep] + ([np.stack(means)] if means else [])).astype(np.float32))
+        return out
