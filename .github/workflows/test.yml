@@ -16,7 +16,9 @@ jobs:
   # nothing about whether the library works.
   pytest:
     name: pytest (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to 26.04 (2026-11), which has no Python 3.9 build for
+    # setup-python; the 3.9 floor runs on 24.04 so it is still tested.
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
