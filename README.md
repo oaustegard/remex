@@ -63,6 +63,22 @@ index.search("which step makes coordinates Gaussian?", top_k=2)
 
 Token vectors from these models tend to share one large direction, so `center=True` matters more here than for single-vector models. On BEIR SciFact with pplx-embed-v2-late-0.6b, centered 2-bit codes scored nDCG@10 0.786 against 0.780 for float32, at 9.6 KB per document instead of 154 KB; uncentered 1-bit codes lost 0.21 ([writeup](https://muninn.austegard.com/blog/sixteen-times-smaller-pplx-late-index.html)). The index decodes the token codes to float32 once for scoring, so query-time memory is the float32 size unless `low_memory=True`, which decodes one block at a time on every query.
 
+sentence-transformers 6.3 can merge a document's similar token vectors before they are stored (token pooling). Give the pooling module to the index and it pools every document it encodes, never the queries; `save` records its settings and `load` restores them. A dict of its settings, such as `{"pool_factor": 4}`, works too:
+
+```python
+from sentence_transformers import MultiVectorEncoder
+from sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling
+from remex import RemexIndex
+
+model = MultiVectorEncoder("lightonai/LateOn")
+index = RemexIndex(model, bits=4, center=True,
+                   token_pooling=HierarchicalTokenPooling(pool_factor=4))
+index.add(docs)
+index.search("which step makes coordinates Gaussian?", top_k=2)
+```
+
+Fewer tokens at more bits beat every token at one bit. On BEIR SciFact and NFCorpus with LateOn (mean of four rotation seeds), a quarter of the tokens at 4 bits stores 4.2 and 4.3 KB per document and scores nDCG@10 0.760 and 0.377; every token at 1 bit stores 5.5 and 5.7 KB and scores 0.749 and 0.370; every token at 8 bits scores 0.763 and 0.382 at 31 and 32 KB. Half the tokens at 2 bits matches a quarter at 4 bits ([`lateon-pool-remex`](https://github.com/oaustegard/experiments/blob/main/lateon-pool-remex/RESULTS.md)). Precomputed token matrices are stored as given, so pool them first if you pass embeddings rather than text.
+
 sentence-transformers is not a dependency: `pip install "remex[sentence-transformers]"` adds it, and `RemexIndex` also takes any object with an `encode` method, or no model and raw embeddings.
 
 ## How it works

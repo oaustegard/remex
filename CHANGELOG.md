@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.2.0 — 2026-11-12
+
+### Added
+
+- **Token pooling for sentence-transformers 6.3 multi-vector models.**
+  `RemexIndex(model, bits, token_pooling=...)` takes a pooling module such as
+  `HierarchicalTokenPooling(pool_factor=4)`, or its settings as a dict, and
+  passes it to `encode_document(token_pooling=...)` on every `add` of text.
+  Queries are never pooled, and precomputed token matrices are stored as
+  given. `save` records the module's settings and class, and `load` rebuilds
+  it on the next `add`, so an index keeps pooling the way it was built. A
+  pooling setting on a single-vector index is refused. Measured on LateOn
+  (SciFact, NFCorpus): a quarter of the tokens at 4 bits scores nDCG@10 0.760
+  and 0.377 in 4.2 and 4.3 KB per document, against 0.749 and 0.370 for every
+  token at 1 bit in 5.5 and 5.7 KB.
+
+Scoring and the container format are unchanged.
+
 ## v2.1.0 — 2026-10-15
 
 Six defects found by an outside-in behavior spec of 2.0.0
