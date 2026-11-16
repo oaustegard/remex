@@ -15,6 +15,8 @@ def coordinate_sigma(d: int, sigma: Optional[float] = None) -> float:
     declare and is passed in explicitly.
     """
     if sigma is None:
+        if isinstance(d, bool) or int(d) != d or d < 1:
+            raise ValueError(f"d must be a positive integer, got {d!r}")
         return 1.0 / float(np.sqrt(d))
     sigma = float(sigma)
     if not np.isfinite(sigma) or sigma <= 0.0:
@@ -84,6 +86,14 @@ def lloyd_max_codebook(
     c32 = centroids.astype(np.float32)
     c64 = c32.astype(np.float64)
     boundaries = ((c64[:-1] + c64[1:]) / 2.0).astype(np.float32)
+    # A sigma far outside float32's range collapses the table to zeros or
+    # overflows it; refuse rather than hand back codes that cannot separate.
+    if not (np.all(np.isfinite(c32)) and np.all(np.diff(c32) > 0)
+            and np.all(np.isfinite(boundaries))):
+        raise ValueError(
+            f"sigma={sigma!r} gives a degenerate float32 codebook at "
+            f"{bits} bits; declare a scale between about 1e-30 and 1e30"
+        )
     return boundaries, c32
 
 
@@ -171,8 +181,20 @@ def assign_codes(X_rot, boundaries, bits: int) -> np.ndarray:
     from remex import _native
     from remex.rotation import PARALLEL_MIN_FLOATS, executor, get_num_threads
 
+    if len(boundaries) != (1 << bits) - 1:
+        raise ValueError(
+            f"{bits}-bit codes need {(1 << bits) - 1} boundaries, "
+            f"got {len(boundaries)}")
     k = _native.kernel()
-    if k is None:
+    X_dtype = np.asarray(X_rot).dtype
+    b_dtype = np.asarray(boundaries).dtype
+    # The kernel compares native float32 or float64 only. Anything else
+    # (integers, other widths, byte-swapped floats, float64 boundaries
+    # against a float32 haystack) goes to searchsorted, which promotes
+    # both sides the way this function promises to match.
+    native = (X_dtype == np.float64
+              or (X_dtype == np.float32 and b_dtype != np.float64))
+    if k is None or not native:
         return np.searchsorted(boundaries, X_rot).astype(np.uint8)
 
     X_rot = np.ascontiguousarray(X_rot)

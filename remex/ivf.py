@@ -116,6 +116,11 @@ class IVFCoarseIndex:
                 f"got {type(compressed).__name__}"
             )
 
+        # Guards first, as in search_coarse: the cell hash below takes its
+        # MSB shift from quantizer.bits, so codes of another width, rotation,
+        # seed or mean would build a wrong index instead of raising.
+        quantizer._check_mode(compressed)
+        quantizer._resolve_centroids(compressed, None)
         self.quantizer = quantizer
         self.compressed = compressed
         self.n_bits = int(n_bits)

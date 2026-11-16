@@ -1,5 +1,59 @@
 # Changelog
 
+## v2.2.1 — 2026-11-16
+
+Defects found by model-based property tests of 2.2.0
+([`oaustegard/experiments/remex-proptest`](https://github.com/oaustegard/experiments/tree/main/remex-proptest)),
+each covered by `tests/test_property_findings.py`.
+
+### Fixed
+
+- **`.npz` files read back the same codes in both container classes.**
+  `CompressedVectors.save` packs one bit stream and `PackedVectors.save` pads
+  each row to a byte. When `d * bits` is not a multiple of 8 the two differ,
+  and reading one class's file with the other returned wrong codes without an
+  error. Both writers now record a `layout` key and both readers honour it.
+  Files without the key are told apart by their byte count. Where the two
+  sizes coincide (for example d=7, n=5 at 1 or 3 bits) an old file is read
+  the way the reading class always read it, which is correct for a file that
+  class wrote.
+- **`Quantizer.search` runs the bits and mean guards on a warm container.**
+  A cache filled by another quantizer skipped them, so with `renorm=False` or
+  in scalar mode a mismatched reader returned plausible scores instead of
+  raising. `search_batch` already ran them.
+- **A pickled or deep-copied rht `Quantizer` no longer segfaults.**
+  `RHTOperator` cached raw buffer addresses; it now pickles as `(d, seed)`.
+- **A rejected first batch leaves a model-less `RemexIndex` usable.** `add([])`
+  raised `ZeroDivisionError` and set `dim=0`, after which every `add` failed.
+  Empty batches raise `ValueError`, and `dim` is set only once a batch is
+  accepted.
+- **`RemexIndex.load` goes through `open_npz`**: it finds the file `save`
+  wrote and names a damaged one.
+- **`IVFCoarseIndex` runs the quantizer's guards when it is built**, instead of
+  hashing codes of another width into a wrong index.
+- **`save_arrow` refuses extra metadata named `d`, `bits`, `n`, `rotation`,
+  `seed`, `scale` or `mean`**, which could relabel the encoding.
+- **A damaged `.npz` member raises the named `ValueError`**, not a zip, zlib or
+  I/O error from the lazy member read.
+- **A seed of 2\*\*63 or more can be saved to `.npz`** (as a decimal string).
+- **`PackedVectors.load` reads an indices-only `.npz`**, as
+  `CompressedVectors.load` does.
+- **Vectors shorter than 1e-8 are coded by their direction.** A 1e-8 floor on
+  the norm shrank them into the central cells; only an exact zero is guarded
+  now. Codes of such vectors change; no other codes do.
+- **Smaller guards**: a `scale` that makes the float32 codebook degenerate is
+  refused; `coordinate_sigma` refuses `d <= 0`; `assign_codes` matches
+  `searchsorted` for integer, byte-swapped and mixed-precision inputs and
+  checks the boundary count; a non-finite row no longer raises a spurious
+  `AnisotropyWarning`; `corpus_mean` of an empty corpus raises.
+
+### Known, not changed
+
+- The 8-bit Lloyd-Max table stops at 300 iterations, with MSE 20% above the
+  fixed point. Converging it would change every stored 8-bit code.
+- `rht` at d=2 gives the same decode for every seed, and at small even d a
+  few seeds leave a coordinate unmixed.
+
 ## v2.2.0 — 2026-11-12
 
 ### Added

@@ -189,8 +189,10 @@ def test_ivf_empty_cell_still_runs_the_guards():
     mu = remex.corpus_mean(X)
     c = Quantizer(d=64, bits=2, seed=42, mean=mu).encode(X)
     wrong = Quantizer(d=64, bits=2, seed=42, mean=mu + 1.0)
-    ivf = IVFCoarseIndex(wrong, c, n_bits=12)
+    # Since 2.2.1 the constructor runs the guards too, so the mismatch can
+    # surface before any probe does; either way it must not answer.
     with pytest.raises(ValueError, match="mean mismatch"):
+        ivf = IVFCoarseIndex(wrong, c, n_bits=12)
         for q in X:
             ivf.search_coarse(q, k=5, nprobe=1)
 

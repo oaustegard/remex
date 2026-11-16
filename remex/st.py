@@ -47,7 +47,7 @@ import numpy as np
 from remex.core import (
     AnisotropyWarning, CompressedVectors, Quantizer, anisotropy, corpus_mean,
 )
-from remex._io import replacing
+from remex._io import npz_read_errors, open_npz, replacing
 from remex.packing import SUPPORTED_BITS
 
 #: Similarities a remex index can rank by. All are built from inner
@@ -301,17 +301,19 @@ class RemexIndex:
         kwargs.update(encode_kwargs)
         return encode(texts, **kwargs)
 
-    def _check_dim(self, d: int) -> None:
-        if self.dim is None:
-            self.dim = d
-        elif d != self.dim:
-            raise ValueError(f"expected dim={self.dim}, got {d}")
+    def _check_dim(self, d: int, expected: Optional[int] = None) -> None:
+        """Validate a batch's width. Never sets ``dim``: ``add`` commits it
+        only once the batch is accepted, so a rejected first batch leaves
+        a model-less index as it was."""
+        expected = self.dim if expected is None else expected
+        if expected is not None and d != expected:
+            raise ValueError(f"expected dim={expected}, got {d}")
 
     def _embed(self, inputs, kind: str, encode_kwargs: dict) -> np.ndarray:
         X = _as_array(self._raw(inputs, kind, encode_kwargs))
         if X.ndim == 1:
             X = X[np.newaxis]
-        if X.ndim != 2 or X.shape[0] == 0:
+        if X.ndim != 2 or 0 in X.shape:
             raise ValueError(f"expected a non-empty (n, d) batch, got {X.shape}")
         if self.similarity == "cosine":
             X = _unit_rows(X)
@@ -327,18 +329,19 @@ class RemexIndex:
         if not mats:
             raise ValueError("expected at least one document")
         for m in mats:
-            if m.ndim != 2 or m.shape[0] == 0:
+            if m.ndim != 2 or 0 in m.shape:
                 raise ValueError(
                     f"each document must be a non-empty (tokens, d) matrix, "
                     f"got {m.shape}"
                 )
-            self._check_dim(m.shape[1])
+            self._check_dim(m.shape[1], self.dim or mats[0].shape[1])
         return mats
 
-    def _encode(self, X: np.ndarray) -> CompressedVectors:
+    def _encode(self, X: np.ndarray,
+                quantizer: Optional[Quantizer] = None) -> CompressedVectors:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            codes = self.quantizer.encode(X)
+            codes = (quantizer or self.quantizer).encode(X)
         for w in caught:
             if issubclass(w.category, AnisotropyWarning):
                 warnings.warn(
@@ -379,10 +382,13 @@ class RemexIndex:
             X = self._embed(documents, "document", encode_kwargs)
         if self.quantizer is None:
             mean = corpus_mean(X) if self.center else None
-            self.quantizer = Quantizer(
-                d=self.dim, bits=self.bits, seed=self.seed, mean=mean
+            quantizer = Quantizer(
+                d=X.shape[1], bits=self.bits, seed=self.seed, mean=mean
             )
-        codes = self._encode(X)
+            codes = self._encode(X, quantizer)
+            self.quantizer, self.dim = quantizer, X.shape[1]
+        else:
+            codes = self._encode(X)
         start = len(self)
         if self.compressed is None:
             self.compressed = codes
@@ -531,7 +537,7 @@ class RemexIndex:
                 text. Its dimension is checked against the file.
             low_memory: As in the constructor; not stored in the file.
         """
-        with np.load(path) as data:
+        with open_npz(path) as data, npz_read_errors(path):
             if "remex_index" not in data:
                 raise ValueError(
                     f"{path} is a remex container but not a RemexIndex: it "

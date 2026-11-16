@@ -22,6 +22,7 @@ import contextlib
 import os
 import uuid
 import zipfile
+import zlib
 from typing import Iterator, Union
 
 import numpy as np
@@ -72,6 +73,21 @@ def replacing(path: PathOrFile, suffix: str = "") -> Iterator[PathOrFile]:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+@contextlib.contextmanager
+def npz_read_errors(path: PathOrFile) -> Iterator[None]:
+    """Name a damaged member of an ``.npz`` the way ``open_npz`` names a
+    damaged archive. ``np.load`` reads members lazily, so a corrupt member
+    surfaces as a zip, zlib or I/O error only when the loader touches it."""
+    try:
+        yield
+    except (zipfile.BadZipFile, zlib.error, EOFError, OSError, RuntimeError,
+            NotImplementedError) as e:
+        raise ValueError(
+            f"{path!r} is a damaged .npz archive: a member could not be read "
+            f"({type(e).__name__}: {e})."
+        ) from e
 
 
 def open_npz(path: PathOrFile):

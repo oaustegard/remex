@@ -9,7 +9,7 @@ from remex.codebook import (
     assign_codes,
     coordinate_sigma, lloyd_max_codebook, nested_codebooks,
 )
-from remex._io import npz_path, open_npz, replacing
+from remex._io import npz_path, npz_read_errors, open_npz, replacing
 from remex.packing import SUPPORTED_BITS, pack, unpack, packed_nbytes
 from remex.rotation import (
     LEGACY_ROTATION, RHTOperator, haar_rotation, identity_rotation,
@@ -48,10 +48,60 @@ def _as_scale(scale) -> Optional[float]:
     return None if scale is None else float(scale)
 
 
+#: Arrow schema-metadata keys that describe the encoding; ``save_arrow``
+#: refuses them as extra metadata so a caller cannot relabel the codes.
+_ARROW_RESERVED = frozenset(
+    {b"d", b"bits", b"n", b"rotation", b"seed", b"scale", b"mean"})
+
+
+def _npz_layout(data, n: int, d: int, bits: int, own: str) -> str:
+    """How a ``.npz`` stores ``packed_indices``: ``"flat"`` (one bit stream,
+    ``CompressedVectors.save``) or ``"rows"`` (each row padded to a byte,
+    ``PackedVectors.save``). The two differ whenever ``d * bits`` is not a
+    multiple of 8. Files since 2.2.1 record it; for older ones the byte count
+    tells them apart, and where it cannot (the two sizes coincide) the file
+    is read the way the reading class always read it.
+    """
+    if "layout" in data:
+        layout = str(data["layout"])
+        if layout not in ("flat", "rows"):
+            raise ValueError(f"unknown packed_indices layout {layout!r}")
+        return layout
+    flat = packed_nbytes(n, d, bits)
+    rows = n * packed_nbytes(1, d, bits)
+    if flat == rows:
+        return own
+    return "rows" if data["packed_indices"].size == rows else "flat"
+
+
+def _unpack_padded_rows(packed: np.ndarray, n: int, d: int, bits: int) -> np.ndarray:
+    """(n, d) codes from a row-padded stream (the ``"rows"`` layout)."""
+    rows = packed.reshape(n, packed_nbytes(1, d, bits))
+    out = np.empty((n, d), dtype=np.uint8)
+    for i in range(n):
+        out[i] = unpack(rows[i], bits, d)
+    return out
+
+
+def _pack_padded_rows(indices: np.ndarray, bits: int) -> np.ndarray:
+    """(n, row_bytes) row-padded packing of (n, d) codes."""
+    n, d = indices.shape
+    if (d * bits) % 8 == 0:
+        return pack(indices.ravel(), bits).reshape(n, packed_nbytes(1, d, bits))
+    out = np.empty((n, packed_nbytes(1, d, bits)), dtype=np.uint8)
+    for i in range(n):
+        out[i] = pack(indices[i], bits)
+    return out
+
+
 def _tag_npz(fields: dict, seed, scale) -> dict:
     """Add the recorded seed and scale to a container's ``.npz`` fields."""
     if seed is not None:
-        fields["seed"] = np.int64(seed)
+        seed = int(seed)
+        # Quantizer and Arrow accept any int; int64 holds most. A larger one
+        # is stored as its decimal string, which _tag_from_npz reads back.
+        fits = -2**63 <= seed < 2**63
+        fields["seed"] = np.int64(seed) if fits else np.str_(str(seed))
     if scale is not None:
         fields["scale"] = np.float64(scale)
     return fields
@@ -62,7 +112,7 @@ def _tag_from_npz(data):
 
     Files written before remex 2.1 record neither, and read back as
     "unknown", which the quantizer does not check."""
-    seed = int(data["seed"]) if "seed" in data.files else None
+    seed = int(str(data["seed"])) if "seed" in data.files else None
     scale = float(data["scale"]) if "scale" in data.files else None
     return seed, scale
 
@@ -119,6 +169,8 @@ def corpus_mean(X: np.ndarray) -> np.ndarray:
     X = np.asarray(X)
     if X.ndim != 2:
         raise ValueError(f"expected a 2-D corpus, got shape {X.shape}")
+    if X.shape[0] == 0:
+        raise ValueError("an empty corpus has no mean")
     return X.mean(axis=0, dtype=np.float64).astype(np.float32)
 
 
@@ -167,7 +219,7 @@ def anisotropy(X: np.ndarray) -> Optional[float]:
 
 def _warn_if_anisotropic(ratio: Optional[float], n: int, bits: int) -> None:
     """Tell the caller about centered mode; never changes what is encoded."""
-    if ratio is None or ratio < ANISOTROPY_WARN_RATIO:
+    if ratio is None or not np.isfinite(ratio) or ratio < ANISOTROPY_WARN_RATIO:
         return
     warnings.warn(
         f"These {n} vectors share a large common direction "
@@ -327,6 +379,7 @@ class CompressedVectors:
         does not know, so such a file still loads as a container."""
         fields = {
             "packed_indices": pack(self.indices.ravel(), self.bits),
+            "layout": np.str_("flat"),
             "d": np.int32(self.d),
             "bits": np.int32(self.bits),
             "n": np.int32(self.n),
@@ -353,7 +406,7 @@ class CompressedVectors:
         ``path`` may omit the ``.npz`` that ``save`` added. A file that is not
         a remex container raises ``ValueError`` saying so.
         """
-        with open_npz(path) as data:
+        with open_npz(path) as data, npz_read_errors(path):
             d = int(data["d"])
             bits = int(data["bits"])
             n = int(data["n"])
@@ -361,8 +414,11 @@ class CompressedVectors:
                         else LEGACY_ROTATION)
 
             if "packed_indices" in data:
-                flat = unpack(data["packed_indices"], bits, n * d)
-                indices = flat.reshape(n, d)
+                if _npz_layout(data, n, d, bits, "flat") == "rows":
+                    indices = _unpack_padded_rows(data["packed_indices"], n, d, bits)
+                else:
+                    flat = unpack(data["packed_indices"], bits, n * d)
+                    indices = flat.reshape(n, d)
             else:
                 # Backward compat: old format stored unpacked indices
                 indices = data["indices"]
@@ -692,6 +748,7 @@ class PackedVectors:
             np.savez_compressed(
                 tmp,
                 packed_indices=self._packed.ravel(),
+                layout=np.str_("rows"),
                 d=np.int32(self.d),
                 bits=np.int32(self.bits),
                 n=np.int32(self.n),
@@ -707,15 +764,22 @@ class PackedVectors:
         A file with no ``rotation`` entry predates the field and is Haar.
         A file with no ``norms`` entry is scalar mode.
         """
-        with open_npz(path) as data:
+        with open_npz(path) as data, npz_read_errors(path):
             d = int(data["d"])
             bits = int(data["bits"])
             n = int(data["n"])
             rotation = (str(data["rotation"]) if "rotation" in data
                         else LEGACY_ROTATION)
             row_bytes = packed_nbytes(1, d, bits)
-            packed_flat = data["packed_indices"]
-            packed = packed_flat.reshape(n, row_bytes)
+            if "packed_indices" not in data:
+                # Backward compat, as in CompressedVectors.load
+                packed = _pack_padded_rows(np.asarray(data["indices"]), bits)
+            elif _npz_layout(data, n, d, bits, "rows") == "flat":
+                packed_flat = data["packed_indices"]
+                codes = unpack(packed_flat, bits, n * d).reshape(n, d)
+                packed = _pack_padded_rows(codes, bits)
+            else:
+                packed = data["packed_indices"].reshape(n, row_bytes)
             norms = data["norms"] if "norms" in data else None
             mean = data["mean"] if "mean" in data else None
             mean_dots = data["mean_dots"] if "mean_dots" in data else None
@@ -770,6 +834,11 @@ class PackedVectors:
             metadata[b"scale"] = repr(self.scale).encode()
         for k, v in extra_metadata.items():
             key = k.encode() if isinstance(k, str) else k
+            if key in _ARROW_RESERVED:
+                raise ValueError(
+                    f"extra metadata key {key.decode()!r} is part of the "
+                    f"encoding and is written from the container itself"
+                )
             metadata[key] = str(v).encode()
 
         fields = [pa.field("packed_indices", pa.binary(row_bytes))]
@@ -1090,7 +1159,10 @@ class Quantizer:
                 dots_out[lo:hi] = (target64 @ mean64).astype(np.float32)
                 target = target64.astype(np.float32)
 
-            X_unit = target / np.maximum(lengths, 1e-8)[:, None]
+            # Guard only an exact zero: a 1e-8 floor shrank directions of
+            # vectors shorter than that into the central cells, so their
+            # codes depended on their length.
+            X_unit = target / np.where(lengths > 0, lengths, 1)[:, None]
             X_rot = self._rotate_rows(X_unit)
             indices[lo:hi] = assign_codes(X_rot, self.boundaries, self.bits)
             if self.mean is not None:
@@ -1663,6 +1735,11 @@ class Quantizer:
                 "with packed.to_compressed() first."
             )
         self._check_rotation(compressed)
+        # A warm _x_hat_rot cache skips _resolve_centroids, so the guards it
+        # would run must run here, as in search_batch.
+        self._check_mode(compressed)
+        self._check_bits(compressed)
+        self._check_mean(compressed)
         query = np.asarray(query, dtype=np.float32)
         q_rot = self._rotate_query(query)
 

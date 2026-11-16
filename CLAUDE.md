@@ -94,7 +94,7 @@ preservation are benchmarked in `bench/specter2_eval.py`.
 
 ```bash
 pip install -e ".[dev]"    # numpy, scipy, pytest, pytest-cov
-pytest                      # 126 tests, ~6 min
+pytest                      # ~650 tests, ~2 min
 pytest tests/test_adc_gpu.py -v  # just ADC/GPU tests, ~30s
 ```
 
@@ -135,6 +135,9 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
   `RemexIndex.save` write through `remex._io.replacing`, which writes a temporary sibling and `os.replace`s it.
   2.0.0 opened the destination directly; a SIGKILL mid-overwrite left 0 bytes. `.npz` readers go through
   `remex._io.open_npz`, which names a damaged or foreign file instead of passing NumPy's errors through.
+- **`.npz` records its packing layout** (since 2.2.1): `layout` is `"flat"` (`CompressedVectors.save`, one bit
+  stream) or `"rows"` (`PackedVectors.save`, rows padded to a byte), and both loaders read either. They differ
+  whenever `d * bits % 8 != 0`; `_npz_layout` infers it from the byte count for older files.
 - **So is the mode**: a scalar-mode container (`normalize=False`) has `norms is None`, and every serializer
   records that by *omitting* the norms column (`.npz`/Arrow) or setting the no-norms flag (`.pq` byte 18,
   bit 0). Decoding or searching across the two modes raises, like a rotation mismatch.

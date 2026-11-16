@@ -404,6 +404,14 @@ class RHTOperator:
         self._ptrs_f32 = self._ss[_FLOAT_DTYPES[0]].ctypes.data
         self._ptrs_f64 = self._ss[_FLOAT_DTYPES[1]].ctypes.data
 
+    def __reduce__(self):
+        # The instance caches raw buffer addresses (``_perms_ptr``,
+        # ``_ptrs_f32``/``_ptrs_f64``) and a CDLL handle. Copied verbatim by
+        # pickle or deepcopy they point at another process's or a freed
+        # object's memory, and the kernel segfaults. Rebuild from (d, seed),
+        # which determines everything else.
+        return (RHTOperator, (self.d, self.seed))
+
     @property
     def nbytes(self) -> int:
         return self.perms.nbytes + sum(a.nbytes for a in self._ss.values())
