@@ -2116,7 +2116,9 @@ class Quantizer:
         self, compressed: CompressedVectors, precision: Optional[int]
     ) -> np.ndarray:
         """Right-shift indices to the requested precision level."""
+        indices = (compressed.unpack_rows(0, compressed.n)
+                   if isinstance(compressed, PackedVectors) else compressed.indices)
         if precision is None or precision == self.bits:
-            return compressed.indices
+            return indices
         shift = self.bits - precision
-        return compressed.indices >> shift
+        return indices >> shift

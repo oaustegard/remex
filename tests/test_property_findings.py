@@ -17,6 +17,11 @@ the shrunk, deterministic witness of one finding.
 - P-09: a seed of 2**63 or more could not be saved to ``.npz``
 - P-10: ``PackedVectors.load`` of an indices-only ``.npz`` raised KeyError
 - P-11: vectors shorter than 1e-8 were coded off their direction
+- P-13: ``_score_vectors`` / ``decode`` of uncentred ``PackedVectors``
+  read ``.indices`` and raised AttributeError
+- P-14: IVF at ``nprobe = 2**n_bits`` added bias and offset in another order
+  than the flat paths, so centred scores differed by an ulp
+- P-15: ``IVFCoarseIndex.candidate_indices(nprobe=1)`` returned a view
 - P-12: degenerate codebooks, ``assign_codes`` dtypes, a NaN-ratio warning,
   ``d <= 0`` and ``corpus_mean`` of nothing
 """
@@ -226,3 +231,41 @@ def test_inf_row_does_not_raise_an_anisotropy_warning():
 def test_corpus_mean_of_an_empty_corpus_is_refused():
     with pytest.raises(ValueError, match="empty"):
         remex.corpus_mean(np.zeros((0, 4), np.float32))
+
+
+# P-13 ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("kw", [{}, {"renorm": False},
+                                {"normalize": False, "scale": 1.0, "rotation": "none"}])
+def test_score_vectors_accepts_packed_codes_in_every_mode(kw):
+    q = Quantizer(16, 4, seed=1, **kw)
+    c = q.encode(data(12, 16))
+    p = PackedVectors.from_compressed(c)
+    Yc, bc = q._score_vectors(c)
+    Yp, bp = q._score_vectors(p)
+    assert np.array_equal(Yc, Yp)
+    assert (bc is None and bp is None) or np.array_equal(bc, bp)
+
+
+# P-14 ---------------------------------------------------------------------
+
+def test_ivf_flat_limit_is_byte_identical_to_search_adc_for_centred_codes():
+    X = data(60, 8, shift=2.0)
+    q = Quantizer(8, 2, seed=1, mean=remex.corpus_mean(X))
+    c = q.encode(X)
+    ivf = IVFCoarseIndex(q, c, n_bits=3)
+    for query in X[:10]:
+        i1, s1 = ivf.search_coarse(query, k=60, nprobe=8)
+        i2, s2 = q.search_adc(c, query, k=60)
+        assert np.array_equal(np.sort(s1), np.sort(s2))
+
+
+# P-15 ---------------------------------------------------------------------
+
+def test_candidate_indices_does_not_alias_the_index():
+    q = Quantizer(16, 2, seed=1)
+    ivf = IVFCoarseIndex(q, q.encode(data(40, 16)), n_bits=2)
+    before = ivf.sorted_idx.copy()
+    for cell in range(4):
+        ivf.candidate_indices(cell, 1)[:] = 0
+    assert np.array_equal(ivf.sorted_idx, before)

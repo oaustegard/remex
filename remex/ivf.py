@@ -278,9 +278,11 @@ class IVFCoarseIndex:
             return np.empty(0, dtype=np.int64)
         if len(cells) == 1:
             c = int(cells[0])
+            # A copy, as the multi-cell branch returns: a view would let the
+            # caller overwrite the index.
             return self.sorted_idx[
                 self.cell_offsets[c] : self.cell_offsets[c + 1]
-            ]
+            ].copy()
         slices = [
             self.sorted_idx[self.cell_offsets[c] : self.cell_offsets[c + 1]]
             for c in cells
@@ -376,12 +378,15 @@ class IVFCoarseIndex:
             end = min(start + chunk_size, n_cand)
             chunk_idx = cand_idx[start:end]
             chunk_scores = table[dim_idx, chunk_idx].sum(axis=1)
-            scores[start:end] = _apply_norms(
+            # Same order as Quantizer.search_adc (bias, then offset), so the
+            # flat limit nprobe = 2**n_bits is byte-identical to it.
+            chunk = _apply_norms(
                 chunk_scores,
                 None if cand_norms is None else cand_norms[start:end],
-            ) + offset
+            )
             if cand_bias is not None:
-                scores[start:end] += cand_bias[start:end]
+                chunk = chunk + cand_bias[start:end]
+            scores[start:end] = chunk + offset
 
         k_eff = min(k, n_cand)
         if k_eff >= n_cand:
@@ -453,10 +458,11 @@ class IVFCoarseIndex:
         fine_scores = _apply_norms(
             X_hat_cand @ q_rot,
             None if norms is None else norms[coarse_idx],
-        ) + self.quantizer._query_offset(query)
+        )
         bias = self.quantizer._row_bias(self.compressed, None)
         if bias is not None:
             fine_scores = fine_scores + bias[coarse_idx]
+        fine_scores = fine_scores + self.quantizer._query_offset(query)
         k_eff = min(k, len(coarse_idx))
         order = np.argsort(-fine_scores)[:k_eff]
         return coarse_idx[order], fine_scores[order]

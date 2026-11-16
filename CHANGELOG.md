@@ -41,6 +41,13 @@ each covered by `tests/test_property_findings.py`.
 - **Vectors shorter than 1e-8 are coded by their direction.** A 1e-8 floor on
   the norm shrank them into the central cells; only an exact zero is guarded
   now. Codes of such vectors change; no other codes do.
+- **`_score_vectors` and `decode` accept uncentred `PackedVectors`**; they read
+  `.indices` and raised `AttributeError` except on centred codes.
+- **IVF's flat limit is byte-identical to the flat paths for centred codes.**
+  `nprobe = 2**n_bits` added the query offset before the row bias, and the flat
+  paths add it after, so scores differed by an ulp.
+- **`IVFCoarseIndex.candidate_indices(nprobe=1)` returns a copy**, not a view
+  through which a caller could overwrite the index.
 - **Smaller guards**: a `scale` that makes the float32 codebook degenerate is
   refused; `coordinate_sigma` refuses `d <= 0`; `assign_codes` matches
   `searchsorted` for integer, byte-swapped and mixed-precision inputs and
@@ -53,6 +60,8 @@ each covered by `tests/test_property_findings.py`.
   fixed point. Converging it would change every stored 8-bit code.
 - `rht` at d=2 gives the same decode for every seed, and at small even d a
   few seeds leave a coordinate unmixed.
+- The constant `q . mu` is added in float32 before top-k, so with
+  `||mu|| / ||x - mu||` around 1e5 or more it can round two rows into a tie.
 
 ## v2.2.0 — 2026-11-12
 
